@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Note: `nvdiffrast` is intentionally not listed in `project.dependencies`.
+# This project requires installing NVlabs/nvdiffrast v0.4.0 from source with
+# `pip install <clone_dir> --no-build-isolation`; see `scripts/install_nvdiffrast.sh`.
+[project]
+name = "nvdiffrast_mesh_renderer"
+version = "0.1.0"
+description = "CUDA + nvdiffrast based GLB/GLTF mesh renderer"
+authors = [
+    { name = "Hwan Heo", email = "gjghks950@naver.com" },
+]
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["nvdiffrast", "renderer", "glb", "gltf", "mesh", "cuda"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Multimedia :: Graphics :: 3D Rendering",
+]
+dependencies = [
+    "imageio>=2.31",
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "Pillow>=10.0",
+    "trimesh>=4.0",
+]
+
+[project.optional-dependencies]
+display = [
+    "glfw>=2.7",
+    "PyOpenGL>=3.1",
+]
+
+[project.scripts]
+nvdiffrast-mesh-render = "nvdiffrast_mesh_renderer.cli:main"
+nvdiffrast-mesh-render-all = "nvdiffrast_mesh_renderer.cli:render_all_modes"
+nvdiffrast-mesh-render-multi-view = "nvdiffrast_mesh_renderer.cli:render_multi_view"
+
+[tool.setuptools.packages.find]
+include = ["nvdiffrast_mesh_renderer*"]

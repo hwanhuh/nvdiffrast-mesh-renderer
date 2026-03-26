@@ -40,6 +40,13 @@ You can also invoke the main CLI as a module:
 python -m nvdiffrast_mesh_renderer --help
 ```
 
+## Entrypoint Lifecycle
+
+- `nvdiffrast-mesh-render`: single render. One renderer/context is created for the invocation, used for one render, then discarded on exit or CUDA failure.
+- `nvdiffrast-mesh-render-all`: sequential multi-render. One renderer/context is reused across all render modes for the invocation.
+- `nvdiffrast-mesh-render-multi-view`: sequential multi-render. One renderer/context is reused across the whole multi-view run, with chunk-based view preparation and renderer recreation before retry after CUDA OOM.
+- `nvdiffrast-mesh-render-batch`: multi-process multi-GPU scheduling. One worker process runs per GPU, and each worker renders sequentially through one renderer/context at a time while clearing texture caches between jobs.
+
 ## Usage
 
 Basic beauty render:

@@ -135,6 +135,7 @@ def _write_multiview_report(output_dir: pathlib.Path, report: str) -> pathlib.Pa
     return report_path
 
 
+# Render-all is a sequential multi-render entrypoint that reuses one renderer/context.
 def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path | None]:
     output_dir = _render_all_output_dir(config.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -264,6 +265,7 @@ def _render_multiview_pass(
     return outputs, rows, attempted_chunk_sizes, chunk_sizes[chunk_size_index]
 
 
+# Standalone multi-view is also sequential: one renderer/context per invocation, no raster thread pool.
 def _render_multiview_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
     if config.render_all:
         raise ValueError("--render-all is not supported together with multi-view rendering")
@@ -342,6 +344,7 @@ def main() -> None:
     if config.render_all:
         _render_all_from_config(config)
         return
+    # Basic CLI mode is a single-render entrypoint with one renderer/context per invocation.
     renderer_cache = RendererCache(device=torch.device(f"cuda:{torch.cuda.current_device()}"))
     try:
         renderer_cache.get(config).render_to_file()

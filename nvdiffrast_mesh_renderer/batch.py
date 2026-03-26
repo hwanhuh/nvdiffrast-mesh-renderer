@@ -1047,6 +1047,7 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
 
 def _worker_main(worker_slot: int, gpu_index: int, job_queue: Any, result_queue: Any) -> None:
     torch.cuda.set_device(gpu_index)
+    # Batch mode isolates concurrency at the process level; each worker uses one renderer/context sequentially.
     renderer_cache = RendererCache(device=torch.device(f"cuda:{gpu_index}"))
     while True:
         job = job_queue.get()
@@ -1206,6 +1207,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 @torch.inference_mode()
 def main() -> None:
+    # Batch is the multi-process, multi-GPU entrypoint; render execution inside each worker remains sequential.
     args = build_argparser().parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for batch rendering")

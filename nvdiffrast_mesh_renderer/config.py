@@ -158,9 +158,9 @@ def build_argparser() -> argparse.ArgumentParser:
         default="beauty",
         help="Named render mode entrypoint.",
     )
-    parser.add_argument("--wireframe-color", default="0,0,0", help="Wireframe overlay color as r,g,b in 0-1 range")
+    parser.add_argument("--wireframe-color", default="0.2,1.0,0.25", help="Wireframe overlay color as r,g,b in 0-1 range")
     parser.add_argument("--wireframe-opacity", type=float, default=1.0, help="Wireframe overlay opacity multiplier")
-    parser.add_argument("--wireframe-thickness-px", type=float, default=1.0, help="Wireframe thickness in pixels")
+    parser.add_argument("--wireframe-thickness-px", type=float, default=0.5, help="Wireframe thickness in pixels")
     parser.add_argument("--normalize-depth", action="store_true", help="Normalize depth outputs across visible pixels for visualization")
     parser.add_argument("--render-all", action="store_true", help="Render every supported mode into a mode-named output directory")
     parser.add_argument("--canonical-six-views", action="store_true", help="Render front, back, left, right, top, and bottom views in one multi-view run")
@@ -226,9 +226,9 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         antialias=not args.no_antialias,
         display=args.display,
         render_mode=getattr(args, "render_mode", "beauty"),
-        wireframe_color=parse_rgb(getattr(args, "wireframe_color", "0,0,0")),
+        wireframe_color=parse_rgb(getattr(args, "wireframe_color", "0.2,1.0,0.25")),
         wireframe_opacity=float(np.clip(getattr(args, "wireframe_opacity", 1.0), 0.0, 1.0)),
-        wireframe_thickness_px=max(float(getattr(args, "wireframe_thickness_px", 1.0)), 0.0),
+        wireframe_thickness_px=max(float(getattr(args, "wireframe_thickness_px", 0.5)), 0.0),
         normalize_depth=bool(getattr(args, "normalize_depth", False)),
         render_all=bool(getattr(args, "render_all", False)),
         canonical_six_views=bool(getattr(args, "canonical_six_views", False)),

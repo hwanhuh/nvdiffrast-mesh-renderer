@@ -56,9 +56,9 @@ nvdiffrast-mesh-render example_meshes/c7fd79edb639400293683095caafff21_1024.glb 
     --output outputs/beauty_wire.png \
     --resolution 1024 \
     --render-mode beauty_plus_wireframe \
-    --wireframe-color 0,1,0 \
+    --wireframe-color 0.2,1.0,0.25 \
     --wireframe-opacity 0.8 \
-    --wireframe-thickness-px 1.25
+    --wireframe-thickness-px 0.5
 ```
 
 Depth visualization:
@@ -493,9 +493,9 @@ args = Namespace(
     no_antialias=False,
     display=False,
     render_mode="beauty",
-    wireframe_color="0,0,0",
+    wireframe_color="0.2,1.0,0.25",
     wireframe_opacity=1.0,
-    wireframe_thickness_px=1.0,
+    wireframe_thickness_px=0.5,
     normalize_depth=False,
     render_all=False,
 )

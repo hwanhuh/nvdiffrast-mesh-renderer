@@ -217,17 +217,26 @@ class GeometryPassRenderer:
         if emissive_tex is not None:
             emissive = emissive * emissive_tex[..., :3]
         ao = torch.ones((*image_shape, 1), dtype=base_rgba.dtype, device=base_rgba.device)
-        ao_tex = sample_texture(material.occlusion_texture, uv, uv_da=uv_da, boundary_mode="wrap")
-        if ao_tex is not None:
-            ao = ao * (1.0 - material.occlusion_strength + material.occlusion_strength * ao_tex[..., :1])
         metallic = torch.full((*image_shape, 1), fill_value=material.metallic_factor, dtype=base_rgba.dtype, device=base_rgba.device)
         roughness = torch.full((*image_shape, 1), fill_value=material.roughness_factor, dtype=base_rgba.dtype, device=base_rgba.device)
-        mr_tex = sample_texture(material.metallic_roughness_texture, uv, uv_da=uv_da, boundary_mode="wrap")
-        if mr_tex is not None:
-            if mr_tex.shape[-1] >= 2:
-                roughness = roughness * mr_tex[..., 1:2]
-            if mr_tex.shape[-1] >= 3:
-                metallic = metallic * mr_tex[..., 2:3]
+        if material.occlusion_texture is not None and material.occlusion_texture is material.metallic_roughness_texture:
+            orm_tex = sample_texture(material.metallic_roughness_texture, uv, uv_da=uv_da, boundary_mode="wrap")
+            if orm_tex is not None:
+                ao = ao * (1.0 - material.occlusion_strength + material.occlusion_strength * orm_tex[..., :1])
+                if orm_tex.shape[-1] >= 2:
+                    roughness = roughness * orm_tex[..., 1:2]
+                if orm_tex.shape[-1] >= 3:
+                    metallic = metallic * orm_tex[..., 2:3]
+        else:
+            ao_tex = sample_texture(material.occlusion_texture, uv, uv_da=uv_da, boundary_mode="wrap")
+            if ao_tex is not None:
+                ao = ao * (1.0 - material.occlusion_strength + material.occlusion_strength * ao_tex[..., :1])
+            mr_tex = sample_texture(material.metallic_roughness_texture, uv, uv_da=uv_da, boundary_mode="wrap")
+            if mr_tex is not None:
+                if mr_tex.shape[-1] >= 2:
+                    roughness = roughness * mr_tex[..., 1:2]
+                if mr_tex.shape[-1] >= 3:
+                    metallic = metallic * mr_tex[..., 2:3]
         return (
             base_rgba.contiguous(),
             emissive.contiguous(),

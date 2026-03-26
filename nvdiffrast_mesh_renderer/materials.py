@@ -1,6 +1,7 @@
 import json
 import pathlib
 import struct
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -11,6 +12,13 @@ from trimesh.visual import material as trimesh_material
 from .math_utils import to_float_array
 from .textures import TextureCache
 from .types import MaterialData
+
+
+@dataclass(frozen=True)
+class GltfMaterialOverrides:
+    normal_scale: float = 1.0
+    occlusion_strength: float = 1.0
+    packed_orm: bool = False
 
 
 def load_gltf_header(path: pathlib.Path) -> Optional[dict]:
@@ -40,7 +48,21 @@ def get_gltf_texture_scalar(material_def: dict, texture_key: str, scalar_key: st
         return default
 
 
-def load_gltf_material_overrides(path: pathlib.Path) -> Dict[str, Tuple[float, float]]:
+def _get_gltf_texture_identity(textures: list[object], texture_info: object) -> Optional[Tuple[str, int]]:
+    if not isinstance(texture_info, dict):
+        return None
+    texture_index = texture_info.get("index")
+    if not isinstance(texture_index, int) or not (0 <= texture_index < len(textures)):
+        return None
+    texture_def = textures[texture_index]
+    if isinstance(texture_def, dict):
+        source_index = texture_def.get("source")
+        if isinstance(source_index, int):
+            return ("source", source_index)
+    return ("texture", texture_index)
+
+
+def load_gltf_material_overrides(path: pathlib.Path) -> Dict[str, GltfMaterialOverrides]:
     try:
         header = load_gltf_header(path)
     except Exception:
@@ -48,6 +70,7 @@ def load_gltf_material_overrides(path: pathlib.Path) -> Dict[str, Tuple[float, f
     if not isinstance(header, dict):
         return {}
     materials = header.get("materials", [])
+    textures = header.get("textures", [])
     overrides, names, name_counts = {}, {}, {}
     for mesh_def in header.get("meshes", []):
         mesh_name = mesh_def.get("name", "GLTF")
@@ -57,12 +80,19 @@ def load_gltf_material_overrides(path: pathlib.Path) -> Dict[str, Tuple[float, f
             material_idx = primitive.get("material")
             if isinstance(material_idx, int) and 0 <= material_idx < len(materials):
                 material_def = materials[material_idx]
-                overrides[geometry_name] = (
-                    get_gltf_texture_scalar(material_def, "normalTexture", "scale", 1.0),
-                    get_gltf_texture_scalar(material_def, "occlusionTexture", "strength", 1.0),
+                pbr_def = material_def.get("pbrMetallicRoughness", {})
+                mr_identity = _get_gltf_texture_identity(
+                    textures,
+                    pbr_def.get("metallicRoughnessTexture") if isinstance(pbr_def, dict) else None,
+                )
+                occlusion_identity = _get_gltf_texture_identity(textures, material_def.get("occlusionTexture"))
+                overrides[geometry_name] = GltfMaterialOverrides(
+                    normal_scale=get_gltf_texture_scalar(material_def, "normalTexture", "scale", 1.0),
+                    occlusion_strength=get_gltf_texture_scalar(material_def, "occlusionTexture", "strength", 1.0),
+                    packed_orm=mr_identity is not None and mr_identity == occlusion_identity,
                 )
             else:
-                overrides[geometry_name] = (1.0, 1.0)
+                overrides[geometry_name] = GltfMaterialOverrides()
     return overrides
 
 
@@ -91,10 +121,16 @@ class MaterialExtractor:
             has_pbr_signals=False,
         )
 
-    def extract(self, mesh, gltf_overrides: Optional[Tuple[float, float]] = None):
+    def extract(self, mesh, gltf_overrides: Optional[Tuple[float, float] | GltfMaterialOverrides] = None):
         visual = mesh.visual
         vertex_colors = None
-        normal_scale, occlusion_strength = (1.0, 1.0) if gltf_overrides is None else map(float, gltf_overrides)
+        if gltf_overrides is None:
+            overrides = GltfMaterialOverrides()
+        elif isinstance(gltf_overrides, GltfMaterialOverrides):
+            overrides = gltf_overrides
+        else:
+            normal_scale, occlusion_strength = map(float, gltf_overrides)
+            overrides = GltfMaterialOverrides(normal_scale=normal_scale, occlusion_strength=occlusion_strength)
         if hasattr(visual, "vertex_colors") and visual.vertex_colors is not None and len(visual.vertex_colors) == len(mesh.vertices):
             colors = torch.as_tensor(np.asarray(visual.vertex_colors, dtype=np.float32), dtype=torch.float32, device=self.device)
             colors = colors / 255.0 if colors.max().item() > 1.0 else colors
@@ -104,17 +140,24 @@ class MaterialExtractor:
             return self._default(), vertex_colors
         if isinstance(material, trimesh_material.PBRMaterial):
             has_pbr_signals = any([material.metallicFactor is not None, material.roughnessFactor is not None, material.metallicRoughnessTexture is not None, material.normalTexture is not None, material.occlusionTexture is not None, material.emissiveTexture is not None, material.emissiveFactor is not None])
+            metallic_roughness_texture = self.cache.get_pil(material.metallicRoughnessTexture, srgb=False, mode="RGB")
+            shared_packed_orm = (
+                material.occlusionTexture is not None
+                and material.metallicRoughnessTexture is not None
+                and (overrides.packed_orm or material.occlusionTexture is material.metallicRoughnessTexture)
+            )
+            occlusion_texture = metallic_roughness_texture if shared_packed_orm else self.cache.get_pil(material.occlusionTexture, srgb=False, mode="L")
             return MaterialData(
                 workflow="pbr" if has_pbr_signals else "diffuse",
                 base_color_factor=torch.tensor(to_float_array(material.baseColorFactor, 4, [1.0, 1.0, 1.0, 1.0]), dtype=torch.float32, device=self.device),
                 base_color_texture=self.cache.get_pil(material.baseColorTexture, srgb=True, mode="RGBA"),
                 metallic_factor=1.0 if material.metallicFactor is None else float(material.metallicFactor),
                 roughness_factor=1.0 if material.roughnessFactor is None else float(material.roughnessFactor),
-                metallic_roughness_texture=self.cache.get_pil(material.metallicRoughnessTexture, srgb=False, mode="RGB"),
+                metallic_roughness_texture=metallic_roughness_texture,
                 normal_texture=self.cache.get_pil(material.normalTexture, srgb=False, mode="RGB"),
-                normal_scale=normal_scale,
-                occlusion_texture=self.cache.get_pil(material.occlusionTexture, srgb=False, mode="L"),
-                occlusion_strength=occlusion_strength,
+                normal_scale=overrides.normal_scale,
+                occlusion_texture=occlusion_texture,
+                occlusion_strength=overrides.occlusion_strength,
                 emissive_factor=torch.tensor(to_float_array(material.emissiveFactor, 3, [0.0, 0.0, 0.0]), dtype=torch.float32, device=self.device),
                 emissive_texture=self.cache.get_pil(material.emissiveTexture, srgb=True, mode="RGB"),
                 alpha_mode=(material.alphaMode or "OPAQUE").upper(),

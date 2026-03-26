@@ -2,6 +2,7 @@ import pathlib
 from dataclasses import dataclass
 from typing import Dict
 
+import numpy as np
 import torch
 
 import nvdiffrast.torch as dr
@@ -13,6 +14,7 @@ from .compositor import LayerCompositor
 from .config import RenderConfig
 from .environment import EnvironmentService
 from .geometry_pass import GeometryPassRenderer
+from .geometry_utils import scene_bounds
 from .ibl import ImageBasedLighting
 from .postprocess import ImagePostprocessor
 from .scene_builder import SceneBuilder
@@ -26,6 +28,8 @@ class PreparedAssets:
     lights: list[tuple[torch.Tensor, torch.Tensor]]
     env: EnvironmentData | None
     ibl: ImageBasedLighting | None
+    center: np.ndarray
+    radius: float
 
 
 @dataclass
@@ -56,6 +60,7 @@ class SceneRenderer:
         self.glctx = dr.RasterizeCudaContext(device=self.device)
         self.cache = TextureCache(self.device)
         self.scene_builder = SceneBuilder(self.cache, self.device)
+        self.scene_builder.configure_geometry_preprocess(config)
         self.environment = EnvironmentService(self.cache)
         self.geometry = GeometryPassRenderer(self.glctx, config)
         self.compositor = LayerCompositor()
@@ -67,14 +72,15 @@ class SceneRenderer:
             raise RuntimeError(f"No renderable meshes found in {input_path}")
         pbr_count = sum(mesh.material.workflow == "pbr" for mesh in meshes)
         print(f"Loaded {len(meshes)} mesh(es): {pbr_count} PBR, {len(meshes) - pbr_count} diffuse")
+        center, radius = scene_bounds(meshes)
         lights = self.scene_builder.build_lights(self.config.light_intensity)
         env = self.environment.build(self.config)
         ibl = ImageBasedLighting(env, self.config.env_diffuse_samples, self.device) if env is not None else None
-        return PreparedAssets(meshes=meshes, lights=lights, env=env, ibl=ibl)
+        return PreparedAssets(meshes=meshes, lights=lights, env=env, ibl=ibl, center=center, radius=radius)
 
     def prepare_view(self, assets: PreparedAssets, config: RenderConfig | None = None) -> PreparedScene:
         current_config = self.config if config is None else config
-        camera = self.scene_builder.build_camera(assets.meshes, current_config)
+        camera = self.scene_builder.build_camera_from_bounds(assets.center, assets.radius, current_config)
         bg_rgb, bg_alpha = self.environment.render_background(camera, current_config, assets.env, self.device)
         return PreparedScene(
             meshes=assets.meshes,

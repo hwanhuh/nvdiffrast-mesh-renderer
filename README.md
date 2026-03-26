@@ -201,6 +201,12 @@ Quality / visibility:
 - `--no-antialias`
 - `--display`
 
+Large-scale preprocessing:
+
+- `--geometry-preprocess-device {auto,cpu,cuda}`
+- `--geometry-cuda-threshold-faces`
+- `--geometry-cuda-threshold-vertices`
+
 ## Project Overview
 
 This is a CUDA + `nvdiffrast` based GLB/GLTF renderer. The current implementation is organized around a shared geometry pass plus a multi-mode render dispatcher, while preserving the earlier projected-winding front/back classification and premultiplied-alpha compositing fixes.
@@ -225,6 +231,8 @@ The installable package is `nvdiffrast_mesh_renderer`, exposed via `nvdiffrast-m
 - Single render, render-all, and multi-view CLI flows
 - Chunked multi-view rendering across azimuth/elevation grids with per-chunk parallel execution
 - Canonical six-view rendering with `front/back/left/right/top/bottom` presets and `6 -> 2` CUDA OOM fallback
+- Faster scene loading by iterating scene graph instances directly instead of `scene.dump(concatenate=False)`
+- Automatic CUDA geometry preprocessing for large meshes to speed up face-normal and tangent generation
 
 ## Repository Layout
 

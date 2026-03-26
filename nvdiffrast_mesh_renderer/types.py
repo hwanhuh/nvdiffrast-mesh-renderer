@@ -36,6 +36,7 @@ class MaterialData:
 class MeshData:
     name: str
     positions: torch.Tensor
+    positions_h: torch.Tensor
     faces: torch.Tensor
     face_normals: torch.Tensor
     normals: torch.Tensor

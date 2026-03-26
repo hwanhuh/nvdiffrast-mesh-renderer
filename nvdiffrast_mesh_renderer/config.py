@@ -43,6 +43,9 @@ class RenderConfig:
     render_all: bool
     canonical_six_views: bool
     multi_view_chunk_size: int
+    geometry_preprocess_device: str
+    geometry_cuda_threshold_faces: int
+    geometry_cuda_threshold_vertices: int
     benchmark_requested: bool
     benchmark_runs: int
     benchmark_warmup_runs: int
@@ -162,6 +165,24 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--render-all", action="store_true", help="Render every supported mode into a mode-named output directory")
     parser.add_argument("--canonical-six-views", action="store_true", help="Render front, back, left, right, top, and bottom views in one multi-view run")
     parser.add_argument("--multi-view-chunk-size", type=int, default=4, help="Maximum number of multi-view jobs to run concurrently per chunk")
+    parser.add_argument(
+        "--geometry-preprocess-device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Where to compute face normals and tangents during mesh loading. auto uses CUDA only for large meshes.",
+    )
+    parser.add_argument(
+        "--geometry-cuda-threshold-faces",
+        type=int,
+        default=100000,
+        help="In auto mode, use CUDA preprocessing when a mesh has at least this many faces.",
+    )
+    parser.add_argument(
+        "--geometry-cuda-threshold-vertices",
+        type=int,
+        default=100000,
+        help="In auto mode, use CUDA preprocessing when a mesh has at least this many vertices.",
+    )
     parser.add_argument("--benchmark-runs", type=int, default=None, help="Enable render-all benchmarking and set timed runs per mode")
     parser.add_argument("--benchmark-warmup-runs", type=int, default=None, help="Enable render-all benchmarking and set untimed warmup runs per mode")
     parser.add_argument("--no-antialias", action="store_true", help="Disable edge antialiasing")
@@ -212,6 +233,9 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         render_all=bool(getattr(args, "render_all", False)),
         canonical_six_views=bool(getattr(args, "canonical_six_views", False)),
         multi_view_chunk_size=max(int(getattr(args, "multi_view_chunk_size", 4)), 1),
+        geometry_preprocess_device=str(getattr(args, "geometry_preprocess_device", "auto")),
+        geometry_cuda_threshold_faces=max(int(getattr(args, "geometry_cuda_threshold_faces", 100000)), 0),
+        geometry_cuda_threshold_vertices=max(int(getattr(args, "geometry_cuda_threshold_vertices", 100000)), 0),
         benchmark_requested=benchmark_requested,
         benchmark_runs=benchmark_runs,
         benchmark_warmup_runs=benchmark_warmup_runs,

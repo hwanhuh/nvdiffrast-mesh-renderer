@@ -6,9 +6,15 @@ import torch
 import trimesh
 
 from .config import RenderConfig
-from .geometry_utils import compute_face_normals, compute_vertex_tangents, scene_bounds
+from .geometry_utils import (
+    compute_face_normals,
+    compute_face_normals_torch,
+    compute_vertex_tangents,
+    compute_vertex_tangents_torch,
+    scene_bounds,
+)
 from .materials import MaterialExtractor, load_gltf_material_overrides
-from .math_utils import look_at, orbit_camera, perspective, safe_normalize
+from .math_utils import look_at, orbit_camera, perspective, safe_normalize, safe_normalize_np
 from .textures import TextureCache
 from .types import CameraData, MeshData
 
@@ -18,13 +24,18 @@ class SceneBuilder:
         self.cache = cache
         self.device = device
         self.materials = MaterialExtractor(cache=cache, device=device)
+        self._geometry_preprocess_device = "auto"
+        self._geometry_cuda_threshold_faces = 100000
+        self._geometry_cuda_threshold_vertices = 100000
 
     def load_meshes(self, path: pathlib.Path) -> List[MeshData]:
         overrides = load_gltf_material_overrides(path)
         scene_or_mesh = trimesh.load(path, force="scene", process=False)
         scene = scene_or_mesh if isinstance(scene_or_mesh, trimesh.Scene) else trimesh.Scene(scene_or_mesh)
         meshes = []
-        for index, mesh in enumerate(scene.dump(concatenate=False)):
+        used_names = {}
+        used_name_counts = {}
+        for index, (mesh_name, mesh, transform) in enumerate(self._iter_scene_meshes(scene)):
             if not isinstance(mesh, trimesh.Trimesh) or mesh.faces is None or len(mesh.faces) == 0:
                 continue
             vertices = np.asarray(mesh.vertices, dtype=np.float32)
@@ -32,17 +43,32 @@ class SceneBuilder:
             normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
             uv = getattr(mesh.visual, "uv", None)
             uv = np.asarray(uv, dtype=np.float32) if uv is not None and len(uv) == len(vertices) else None
-            tangents = compute_vertex_tangents(vertices, faces, uv, normals) if uv is not None else None
-            material, vertex_colors = self.materials.extract(mesh, overrides.get(mesh.metadata.get("name", "")))
+            vertices, normals = self._apply_transform(vertices, normals, transform)
+            material, vertex_colors = self.materials.extract(mesh, overrides.get(mesh_name))
+            use_cuda_preprocess = self._should_preprocess_on_cuda(vertices, faces)
+            positions = torch.as_tensor(vertices, dtype=torch.float32, device=self.device).contiguous()
+            positions_h = torch.cat([positions, torch.ones_like(positions[:, :1])], dim=-1).contiguous()
+            faces_t = torch.as_tensor(faces, dtype=torch.int32, device=self.device).contiguous()
+            normals_t = torch.as_tensor(normals, dtype=torch.float32, device=self.device).contiguous()
+            uv_t = None if uv is None else torch.as_tensor(uv, dtype=torch.float32, device=self.device).contiguous()
+            if use_cuda_preprocess:
+                face_normals = compute_face_normals_torch(positions, faces_t)
+                tangents = compute_vertex_tangents_torch(positions, faces_t, uv_t, normals_t) if uv_t is not None else None
+            else:
+                tangents_np = compute_vertex_tangents(vertices, faces, uv, normals) if uv is not None else None
+                face_normals = torch.as_tensor(compute_face_normals(vertices, faces), dtype=torch.float32, device=self.device).contiguous()
+                tangents = None if tangents_np is None else torch.as_tensor(tangents_np, dtype=torch.float32, device=self.device).contiguous()
+            instance_name = trimesh.util.unique_name(mesh_name or f"mesh_{index}", used_names, counts=used_name_counts)
             meshes.append(
                 MeshData(
-                    name=mesh.metadata.get("name", f"mesh_{index}"),
-                    positions=torch.as_tensor(vertices, dtype=torch.float32, device=self.device).contiguous(),
-                    faces=torch.as_tensor(faces, dtype=torch.int32, device=self.device).contiguous(),
-                    face_normals=torch.as_tensor(compute_face_normals(vertices, faces), dtype=torch.float32, device=self.device).contiguous(),
-                    normals=torch.as_tensor(normals, dtype=torch.float32, device=self.device).contiguous(),
-                    uv=None if uv is None else torch.as_tensor(uv, dtype=torch.float32, device=self.device).contiguous(),
-                    tangents=None if tangents is None else torch.as_tensor(tangents, dtype=torch.float32, device=self.device).contiguous(),
+                    name=instance_name,
+                    positions=positions,
+                    positions_h=positions_h,
+                    faces=faces_t,
+                    face_normals=face_normals.contiguous(),
+                    normals=normals_t,
+                    uv=uv_t,
+                    tangents=None if tangents is None else tangents.contiguous(),
                     vertex_colors=None if vertex_colors is None else vertex_colors.contiguous(),
                     material=material,
                 )
@@ -51,6 +77,9 @@ class SceneBuilder:
 
     def build_camera(self, meshes: Sequence[MeshData], config: RenderConfig) -> CameraData:
         center, radius = scene_bounds(meshes)
+        return self.build_camera_from_bounds(center, radius, config)
+
+    def build_camera_from_bounds(self, center: np.ndarray, radius: float, config: RenderConfig) -> CameraData:
         eye, target, distance = orbit_camera(center, radius, config.elev, config.azim, config.fov, config.distance_scale, config.distance)
         near = max(0.01, distance - radius * 2.5)
         far = distance + radius * 2.5
@@ -76,3 +105,46 @@ class SceneBuilder:
             light_color = torch.tensor(color, device=self.device, dtype=torch.float32)
             lights.append((direction_world.view(1, 1, 1, 3), light_color.view(1, 1, 1, 3) * strength))
         return lights
+
+    def _iter_scene_meshes(self, scene: trimesh.Scene):
+        if len(scene.geometry) == 0:
+            return
+        nodes = list(getattr(scene.graph, "nodes_geometry", []))
+        if not nodes:
+            for geom_name, mesh in scene.geometry.items():
+                yield geom_name, mesh, np.eye(4, dtype=np.float32)
+            return
+        for node_name in nodes:
+            transform, geom_name = scene.graph[node_name]
+            mesh = scene.geometry.get(geom_name)
+            if mesh is not None:
+                yield geom_name, mesh, np.asarray(transform, dtype=np.float32)
+
+    def _apply_transform(
+        self,
+        vertices: np.ndarray,
+        normals: np.ndarray,
+        transform: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if np.allclose(transform, np.eye(4, dtype=np.float32), atol=1e-8):
+            return vertices, safe_normalize_np(normals.astype(np.float32, copy=False))
+        linear = np.asarray(transform[:3, :3], dtype=np.float32)
+        translate = np.asarray(transform[:3, 3], dtype=np.float32)
+        normal_matrix = np.linalg.inv(linear).T.astype(np.float32)
+        transformed_vertices = vertices @ linear.T + translate
+        transformed_normals = safe_normalize_np(normals @ normal_matrix.T)
+        return transformed_vertices.astype(np.float32, copy=False), transformed_normals.astype(np.float32, copy=False)
+
+    def _should_preprocess_on_cuda(self, vertices: np.ndarray, faces: np.ndarray) -> bool:
+        if self.device.type != "cuda":
+            return False
+        if self._geometry_preprocess_device == "cpu":
+            return False
+        if self._geometry_preprocess_device == "cuda":
+            return True
+        return len(faces) >= self._geometry_cuda_threshold_faces or len(vertices) >= self._geometry_cuda_threshold_vertices
+
+    def configure_geometry_preprocess(self, config: RenderConfig) -> None:
+        self._geometry_preprocess_device = config.geometry_preprocess_device
+        self._geometry_cuda_threshold_faces = config.geometry_cuda_threshold_faces
+        self._geometry_cuda_threshold_vertices = config.geometry_cuda_threshold_vertices

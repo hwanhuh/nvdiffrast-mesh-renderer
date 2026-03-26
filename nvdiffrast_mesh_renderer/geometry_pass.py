@@ -16,14 +16,16 @@ class GeometryPassRenderer:
         self.config = config
 
     def render_geometry_pass(self, mesh: MeshData, camera: CameraData) -> List[RenderLayer]:
-        front_tri, front_normals, back_tri, back_normals = self._split_triangles_by_facing(mesh, camera)
+        clip_pos = torch.matmul(mesh.positions_h, camera.mvp.t()).contiguous()
+        view_attr = torch.matmul(mesh.positions_h, camera.view.t())[:, :3].contiguous()
+        front_tri, front_normals, back_tri, back_normals = self._split_triangles_by_facing(mesh.faces, mesh.face_normals, clip_pos)
         cull_backfaces = self.config.cull_mode == "force" or (self.config.cull_mode == "auto" and not mesh.material.double_sided)
         layers = []
-        front = self._render_layer(mesh, camera, front_tri, front_normals, side="front")
+        front = self._render_layer(mesh, camera, clip_pos, view_attr, front_tri, front_normals, side="front")
         if front is not None:
             layers.append(front)
         if not cull_backfaces:
-            back = self._render_layer(mesh, camera, back_tri, back_normals, side="back")
+            back = self._render_layer(mesh, camera, clip_pos, view_attr, back_tri, back_normals, side="back")
             if back is not None:
                 layers.append(back)
         return layers
@@ -32,21 +34,21 @@ class GeometryPassRenderer:
         self,
         mesh: MeshData,
         camera: CameraData,
+        clip_pos: torch.Tensor,
+        view_attr: torch.Tensor,
         tri: torch.Tensor,
         face_normals: torch.Tensor,
         side: str,
     ) -> Optional[RenderLayer]:
         if tri.shape[0] == 0:
             return None
-        pos_h = torch.cat([mesh.positions, torch.ones_like(mesh.positions[:, :1])], dim=-1).contiguous()
-        clip_pos = torch.matmul(pos_h, camera.mvp.t()).unsqueeze(0).contiguous()
-        rast, rast_db = self._rasterize_triangles(clip_pos, tri)
+        clip_pos_batch = clip_pos.unsqueeze(0)
+        rast, rast_db = self._rasterize_triangles(clip_pos_batch, tri)
         valid = rast[..., 3:] > 0
         if not valid.any():
             return None
         uvw = torch.cat([rast[..., :2], 1.0 - rast[..., :1] - rast[..., 1:2]], dim=-1)
         world_pos, _ = dr.interpolate(mesh.positions.contiguous(), rast, tri)
-        view_attr = torch.matmul(pos_h, camera.view.t())[:, :3].contiguous()
         view_pos, _ = dr.interpolate(view_attr, rast, tri)
         normal_world, _ = dr.interpolate(mesh.normals.contiguous(), rast, tri)
         uv, uv_da = self._interpolate_optional(mesh.uv, rast, tri, rast_db, "all")
@@ -81,7 +83,7 @@ class GeometryPassRenderer:
                 ao=ao,
                 roughness=roughness,
                 metallic=metallic,
-                clip_pos=clip_pos,
+                clip_pos=clip_pos_batch,
                 tri=tri,
                 side=side,
             ),
@@ -104,24 +106,27 @@ class GeometryPassRenderer:
         bary, bary_db = dr.interpolate(corner_bary, rast, wire_tri, rast_db=rast_db, diff_attrs="all")
         return rast, rast_db, valid, bary_db, bary
 
-    def _split_triangles_by_facing(self, mesh: MeshData, camera: CameraData) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        pos_h = torch.cat([mesh.positions, torch.ones_like(mesh.positions[:, :1])], dim=-1).contiguous()
-        clip_pos = torch.matmul(pos_h, camera.mvp.t()).contiguous()
-        tri_clip = clip_pos[mesh.faces]
+    def _split_triangles_by_facing(
+        self,
+        faces: torch.Tensor,
+        face_normals: torch.Tensor,
+        clip_pos: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        tri_clip = clip_pos[faces]
         w = torch.where(torch.abs(tri_clip[..., 3:4]) < 1e-8, torch.full_like(tri_clip[..., 3:4], 1e-8), tri_clip[..., 3:4])
         tri_ndc_xy = tri_clip[..., :2] / w
         e1 = tri_ndc_xy[:, 1] - tri_ndc_xy[:, 0]
         e2 = tri_ndc_xy[:, 2] - tri_ndc_xy[:, 0]
         front_mask = (e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]) >= 0.0
         if front_mask.all():
-            return mesh.faces, mesh.face_normals, mesh.faces.new_zeros((0, 3)), mesh.face_normals.new_zeros((0, 3))
+            return faces, face_normals, faces.new_zeros((0, 3)), face_normals.new_zeros((0, 3))
         if (~front_mask).all():
-            return mesh.faces.new_zeros((0, 3)), mesh.face_normals.new_zeros((0, 3)), mesh.faces, mesh.face_normals
+            return faces.new_zeros((0, 3)), face_normals.new_zeros((0, 3)), faces, face_normals
         return (
-            mesh.faces[front_mask].contiguous(),
-            mesh.face_normals[front_mask].contiguous(),
-            mesh.faces[~front_mask].contiguous(),
-            mesh.face_normals[~front_mask].contiguous(),
+            faces[front_mask].contiguous(),
+            face_normals[front_mask].contiguous(),
+            faces[~front_mask].contiguous(),
+            face_normals[~front_mask].contiguous(),
         )
 
     def _interpolate_optional(

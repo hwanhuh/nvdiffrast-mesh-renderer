@@ -807,6 +807,7 @@ def _build_job_report(
     started_at: str,
     finished_at: str,
     duration_ms: float,
+    session_init_ms: float,
     prepare_assets_ms: float,
     prepare_views_ms_total: float,
     render_ms_total: float,
@@ -826,6 +827,7 @@ def _build_job_report(
         "started_at": started_at,
         "finished_at": finished_at,
         "duration_ms": _round(duration_ms),
+        "session_init_ms": _round(session_init_ms),
         "prepare_assets_ms": _round(prepare_assets_ms),
         "prepare_views_ms_total": _round(prepare_views_ms_total),
         "render_ms_total": _round(render_ms_total),
@@ -854,6 +856,7 @@ def _write_failed_job_report_if_needed(
     started_at: str,
     finished_at: str,
     duration_ms: float,
+    session_init_ms: float,
     prepare_assets_ms: float,
     prepare_views_ms_total: float,
     render_ms_total: float,
@@ -877,6 +880,7 @@ def _write_failed_job_report_if_needed(
         started_at=started_at,
         finished_at=finished_at,
         duration_ms=duration_ms,
+        session_init_ms=session_init_ms,
         prepare_assets_ms=prepare_assets_ms,
         prepare_views_ms_total=prepare_views_ms_total,
         render_ms_total=render_ms_total,
@@ -899,6 +903,7 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
     temp_output_dir = pathlib.Path(job.temp_output_dir)
     started_at = _utc_now()
     overall_start = time.perf_counter()
+    session_init_ms = 0.0
     prepare_assets_ms = 0.0
     prepare_views_ms_total = 0.0
     render_ms_total = 0.0
@@ -916,7 +921,10 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
             _remove_path(output_dir)
         output_dir.parent.mkdir(parents=True, exist_ok=True)
         renderer_cache.clear_texture_caches()
-        renderer = renderer_cache.get(job.render_config)
+        init_start = time.perf_counter()
+        renderer, created = renderer_cache.get_with_status(job.render_config)
+        if created:
+            session_init_ms += (time.perf_counter() - init_start) * 1000.0
         prepare_start = time.perf_counter()
         assets = renderer.prepare_assets(pathlib.Path(job.input_path))
         prepare_assets_ms = (time.perf_counter() - prepare_start) * 1000.0
@@ -946,7 +954,10 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
                     )
                     renderer = None
                     renderer_cache.reset_after_cuda_failure(job.render_config)
-                    renderer = renderer_cache.get(job.render_config)
+                    init_start = time.perf_counter()
+                    renderer, created = renderer_cache.get_with_status(job.render_config)
+                    if created:
+                        session_init_ms += (time.perf_counter() - init_start) * 1000.0
                     continue
                 if is_cuda_failure(exc):
                     renderer = None
@@ -968,6 +979,7 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
                 started_at=started_at,
                 finished_at=finished_at,
                 duration_ms=duration_ms,
+                session_init_ms=session_init_ms,
                 prepare_assets_ms=prepare_assets_ms,
                 prepare_views_ms_total=prepare_views_ms_total,
                 render_ms_total=render_ms_total,
@@ -994,6 +1006,7 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
             "started_at": started_at,
             "finished_at": finished_at,
             "duration_ms": duration_ms,
+            "session_init_ms": session_init_ms,
             "prepare_assets_ms": prepare_assets_ms,
             "prepare_views_ms_total": prepare_views_ms_total,
             "render_ms_total": render_ms_total,
@@ -1020,6 +1033,7 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
             started_at=started_at,
             finished_at=finished_at,
             duration_ms=duration_ms,
+            session_init_ms=session_init_ms,
             prepare_assets_ms=prepare_assets_ms,
             prepare_views_ms_total=prepare_views_ms_total,
             render_ms_total=render_ms_total,
@@ -1042,6 +1056,7 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
             "started_at": started_at,
             "finished_at": finished_at,
             "duration_ms": duration_ms,
+            "session_init_ms": session_init_ms,
             "prepare_assets_ms": prepare_assets_ms,
             "prepare_views_ms_total": prepare_views_ms_total,
             "render_ms_total": render_ms_total,
@@ -1146,6 +1161,7 @@ def _external_failure_result(job: JobSpec, worker: WorkerState, *, error_type: s
         started_at=started_at,
         finished_at=finished_at,
         duration_ms=duration_ms,
+        session_init_ms=0.0,
         prepare_assets_ms=0.0,
         prepare_views_ms_total=0.0,
         render_ms_total=0.0,
@@ -1168,6 +1184,7 @@ def _external_failure_result(job: JobSpec, worker: WorkerState, *, error_type: s
         "started_at": started_at,
         "finished_at": finished_at,
         "duration_ms": duration_ms,
+        "session_init_ms": 0.0,
         "prepare_assets_ms": 0.0,
         "prepare_views_ms_total": 0.0,
         "render_ms_total": 0.0,
@@ -1180,6 +1197,43 @@ def _external_failure_result(job: JobSpec, worker: WorkerState, *, error_type: s
         "error_message": error_message,
         "traceback": None,
     }
+
+
+def _format_batch_timing_console(duration_ms: float, success_metrics: list[dict[str, Any]]) -> str:
+    if not success_metrics:
+        return f"[Info] Batch Timing: total_elapsed={format_duration_ms(duration_ms)}"
+    count = len(success_metrics)
+    avg_session_init_ms = sum(item["session_init_ms"] for item in success_metrics) / count
+    avg_prepare_assets_ms = sum(item["prepare_assets_ms"] for item in success_metrics) / count
+    avg_prepare_views_ms = sum(item["prepare_views_ms_total"] for item in success_metrics) / count
+    avg_render_ms = sum(item["render_ms_total"] for item in success_metrics) / count
+    avg_save_ms = sum(item["save_ms_total"] for item in success_metrics) / count
+    aggregate_session_init_ms = sum(item["session_init_ms"] for item in success_metrics)
+    aggregate_prepare_assets_ms = sum(item["prepare_assets_ms"] for item in success_metrics)
+    aggregate_prepare_views_ms = sum(item["prepare_views_ms_total"] for item in success_metrics)
+    aggregate_render_ms = sum(item["render_ms_total"] for item in success_metrics)
+    aggregate_save_ms = sum(item["save_ms_total"] for item in success_metrics)
+    return "\n".join(
+        [
+            (
+                "[Info] Batch Timing: "
+                f"total_elapsed={format_duration_ms(duration_ms)}, "
+                f"avg_success_session_init={format_duration_ms(avg_session_init_ms)}, "
+                f"avg_success_data_loading={format_duration_ms(avg_prepare_assets_ms)}, "
+                f"avg_success_scene_prepare={format_duration_ms(avg_prepare_views_ms)}, "
+                f"avg_success_render={format_duration_ms(avg_render_ms)}, "
+                f"avg_success_save={format_duration_ms(avg_save_ms)}"
+            ),
+            (
+                "[Info] Batch Worker Time: "
+                f"aggregate_session_init={format_duration_ms(aggregate_session_init_ms)}, "
+                f"aggregate_data_loading={format_duration_ms(aggregate_prepare_assets_ms)}, "
+                f"aggregate_scene_prepare={format_duration_ms(aggregate_prepare_views_ms)}, "
+                f"aggregate_render={format_duration_ms(aggregate_render_ms)}, "
+                f"aggregate_save={format_duration_ms(aggregate_save_ms)}"
+            ),
+        ]
+    )
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -1555,8 +1609,17 @@ def main() -> None:
 
     finished_at = _utc_now()
     duration_sec = time.perf_counter() - batch_start_perf
+    duration_ms = duration_sec * 1000.0
+    avg_session_init_ms = sum(item["session_init_ms"] for item in success_metrics) / len(success_metrics) if success_metrics else 0.0
     avg_prepare_assets_ms = sum(item["prepare_assets_ms"] for item in success_metrics) / len(success_metrics) if success_metrics else 0.0
+    avg_prepare_views_ms = sum(item["prepare_views_ms_total"] for item in success_metrics) / len(success_metrics) if success_metrics else 0.0
     avg_render_ms_per_mesh = sum(item["render_ms_total"] for item in success_metrics) / len(success_metrics) if success_metrics else 0.0
+    avg_save_ms_per_mesh = sum(item["save_ms_total"] for item in success_metrics) / len(success_metrics) if success_metrics else 0.0
+    aggregate_session_init_ms = sum(item["session_init_ms"] for item in success_metrics)
+    aggregate_prepare_assets_ms = sum(item["prepare_assets_ms"] for item in success_metrics)
+    aggregate_prepare_views_ms = sum(item["prepare_views_ms_total"] for item in success_metrics)
+    aggregate_render_ms = sum(item["render_ms_total"] for item in success_metrics)
+    aggregate_save_ms = sum(item["save_ms_total"] for item in success_metrics)
     total_views = sum(item["view_count"] for item in success_metrics)
     avg_render_ms_per_view = sum(item["render_ms_total"] for item in success_metrics) / total_views if total_views else 0.0
     avg_views_per_mesh = total_views / len(success_metrics) if success_metrics else 0.0
@@ -1571,10 +1634,18 @@ def main() -> None:
         "success_count": success_count,
         "failed_count": failed_count,
         "skipped_count": skipped_count,
+        "avg_session_init_ms": _round(avg_session_init_ms),
         "avg_prepare_assets_ms": _round(avg_prepare_assets_ms),
+        "avg_prepare_views_ms_per_mesh": _round(avg_prepare_views_ms),
         "avg_render_ms_per_mesh": _round(avg_render_ms_per_mesh),
+        "avg_save_ms_per_mesh": _round(avg_save_ms_per_mesh),
         "avg_render_ms_per_view": _round(avg_render_ms_per_view),
         "avg_views_per_mesh": _round(avg_views_per_mesh),
+        "aggregate_session_init_ms": _round(aggregate_session_init_ms),
+        "aggregate_prepare_assets_ms": _round(aggregate_prepare_assets_ms),
+        "aggregate_prepare_views_ms": _round(aggregate_prepare_views_ms),
+        "aggregate_render_ms": _round(aggregate_render_ms),
+        "aggregate_save_ms": _round(aggregate_save_ms),
         "gpu_list": gpu_list,
     }
     _write_json(summary_path, summary)
@@ -1591,6 +1662,11 @@ def main() -> None:
     batch_logger.log(
         f"Finished batch run: success={success_count}, failed={failed_count}, skipped={skipped_count}, "
         f"duration_sec={_round(duration_sec)}, summary={summary_path}"
+    )
+    batch_logger.log(
+        f"Batch timing summary: duration_ms={_round(duration_ms)}",
+        console="always",
+        console_message=_format_batch_timing_console(duration_ms, success_metrics),
     )
     batch_logger.log(
         f"Batch progress completed: {processed_count}/{total_selected}",

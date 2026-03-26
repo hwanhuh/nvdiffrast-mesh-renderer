@@ -1,6 +1,6 @@
 import pathlib
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Sequence
 
 import numpy as np
 import torch
@@ -20,7 +20,7 @@ from .logging_utils import RunLogger
 from .postprocess import ImagePostprocessor
 from .scene_builder import SceneBuilder
 from .textures import TextureCache
-from .types import CameraData, EnvironmentData, MeshData
+from .types import CameraData, EnvironmentData, MeshData, RenderImage
 
 
 @dataclass
@@ -114,18 +114,44 @@ class SceneRenderer:
     def prepare_scene(self, input_path: pathlib.Path) -> PreparedScene:
         return self.prepare_view(self.prepare_assets(input_path))
 
+    def _build_render_registry(self, prepared: PreparedScene) -> RenderModeRegistry:
+        return RenderModeRegistry(RenderModeRenderer(self.config, prepared.lights, prepared.ibl, self.geometry, self.compositor))
+
+    def _finalize_mesh_layers(self, mesh_layers: list[RenderImage], alpha_mode: str) -> list[RenderImage]:
+        if len(mesh_layers) == 2 and self.config.double_sided_depth_peels <= 1:
+            return [self.compositor.merge_double_sided(mesh_layers[0], mesh_layers[1], alpha_mode)]
+        return list(mesh_layers)
+
+    def _postprocess_layers(self, prepared: PreparedScene, layer_images: Sequence[RenderImage], render_mode: str):
+        final_rgb, final_alpha = self.compositor.composite_mesh_layers(prepared.bg_rgb, prepared.bg_alpha, layer_images)
+        return self.postprocessor.postprocess(final_rgb, final_alpha, render_mode=render_mode)
+
+    def render_prepared_modes(
+        self,
+        prepared: PreparedScene,
+        render_modes: Sequence[str],
+    ) -> dict[str, np.ndarray]:
+        modes = tuple(render_modes)
+        registry = self._build_render_registry(prepared)
+        layer_images_by_mode: dict[str, list[RenderImage]] = {mode: [] for mode in modes}
+        for mesh in prepared.meshes:
+            geometry_layers = self.geometry.render_geometry_pass(mesh, prepared.camera)
+            if not geometry_layers:
+                continue
+            mesh_layers_by_mode: dict[str, list[RenderImage]] = {mode: [] for mode in modes}
+            for layer in geometry_layers:
+                for mode in modes:
+                    mesh_layers_by_mode[mode].append(registry.render(mode, layer, prepared.camera))
+            for mode, mesh_layers in mesh_layers_by_mode.items():
+                layer_images_by_mode[mode].extend(self._finalize_mesh_layers(mesh_layers, mesh.material.alpha_mode))
+        return {
+            mode: self._postprocess_layers(prepared, layer_images_by_mode[mode], mode)
+            for mode in modes
+        }
+
     def render_prepared(self, prepared: PreparedScene, render_mode: str | None = None):
         mode = self.config.render_mode if render_mode is None else render_mode
-        registry = RenderModeRegistry(RenderModeRenderer(self.config, prepared.lights, prepared.ibl, self.geometry, self.compositor))
-        layer_images = []
-        for mesh in prepared.meshes:
-            mesh_layers = [registry.render(mode, layer, prepared.camera) for layer in self.geometry.render_geometry_pass(mesh, prepared.camera)]
-            if len(mesh_layers) == 2 and self.config.double_sided_depth_peels <= 1:
-                layer_images.append(self.compositor.merge_double_sided(mesh_layers[0], mesh_layers[1], mesh.material.alpha_mode))
-            else:
-                layer_images.extend(mesh_layers)
-        final_rgb, final_alpha = self.compositor.composite_mesh_layers(prepared.bg_rgb, prepared.bg_alpha, layer_images)
-        return self.postprocessor.postprocess(final_rgb, final_alpha, render_mode=mode)
+        return self.render_prepared_modes(prepared, (mode,))[mode]
 
     def render(self, input_path: pathlib.Path, render_mode: str | None = None, prepared: PreparedScene | None = None):
         scene = self.prepare_scene(input_path) if prepared is None else prepared

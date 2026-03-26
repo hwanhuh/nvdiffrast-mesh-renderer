@@ -15,7 +15,6 @@ pip-wheel-metadata/
 .venv/
 venv/
 env/
-tests/
 
 # Test / tooling caches
 .pytest_cache/

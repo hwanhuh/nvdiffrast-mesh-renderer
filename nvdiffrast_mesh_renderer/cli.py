@@ -1,6 +1,6 @@
 import pathlib
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -60,15 +60,60 @@ def _cuda_sync() -> None:
         torch.cuda.synchronize()
 
 
-def _format_render_all_report(config, mode_rows: list[tuple[str, pathlib.Path, list[float] | None]]) -> str:
+@dataclass(frozen=True)
+class TimingBreakdown:
+    total_ms: float
+    session_init_ms: float = 0.0
+    data_loading_ms: float = 0.0
+    scene_prepare_ms: float = 0.0
+    render_ms: float = 0.0
+    save_ms: float = 0.0
+
+
+def _timing_summary_fields(timing: TimingBreakdown) -> list[tuple[str, float]]:
+    fields = [
+        ("total_elapsed", timing.total_ms),
+        ("session_init", timing.session_init_ms),
+        ("data_loading", timing.data_loading_ms),
+    ]
+    if timing.scene_prepare_ms > 0.0:
+        fields.append(("scene_prepare", timing.scene_prepare_ms))
+    fields.extend(
+        [
+            ("render", timing.render_ms),
+            ("save", timing.save_ms),
+        ]
+    )
+    return fields
+
+
+def _timing_summary_report_lines(timing: TimingBreakdown) -> list[str]:
+    return [f"{label}: {format_duration_ms(value)}" for label, value in _timing_summary_fields(timing)]
+
+
+def _timing_summary_console_message(label: str, timing: TimingBreakdown) -> str:
+    parts = ", ".join(f"{name}={format_duration_ms(value)}" for name, value in _timing_summary_fields(timing))
+    return f"[Info] {label}: {parts}"
+
+
+def _format_render_all_report(
+    config,
+    mode_rows: list[tuple[str, pathlib.Path, list[float] | None]],
+    timing: TimingBreakdown,
+) -> str:
     lines = [
         "Render-All Report",
         f"input: {config.input}",
         f"resolution: {config.resolution}",
         f"benchmark_requested: {str(bool(config.benchmark_requested)).lower()}",
+        f"mode_batching_enabled: {str((not config.benchmark_requested) and config.render_all_batch_size > 1).lower()}",
+        f"mode_batch_size: {1 if config.benchmark_requested else config.render_all_batch_size}",
         f"warmup_runs_per_mode: {config.benchmark_warmup_runs if config.benchmark_requested else 0}",
         f"timed_runs_per_mode: {config.benchmark_runs if config.benchmark_requested else 0}",
         f"mode_count: {len(mode_rows)}",
+        "",
+        "Timing Summary",
+        *_timing_summary_report_lines(timing),
         "",
     ]
     if config.benchmark_requested:
@@ -96,6 +141,13 @@ def _write_render_all_report(output_dir: pathlib.Path, report: str) -> pathlib.P
     report_path = output_dir / "render_all_report.txt"
     report_path.write_text(report, encoding="utf-8")
     return report_path
+
+
+def _render_all_mode_batch_sizes(config, total_modes: int) -> tuple[int, ...]:
+    if config.benchmark_requested:
+        return (1,)
+    batch_size = min(max(config.render_all_batch_size, 1), total_modes)
+    return tuple(range(batch_size, 0, -1))
 
 
 def _is_multi_view(config) -> bool:
@@ -146,7 +198,12 @@ def _multi_view_output_path(output_dir: pathlib.Path, suffix: str, index: int, e
     return output_dir / f"{index:04d}_elev_{_format_angle(elev)}_azim_{_format_angle(azim)}{suffix}"
 
 
-def _format_multiview_report(config, rows: list[tuple[int, str | None, float, float, pathlib.Path]], chunk_size_info: str) -> str:
+def _format_multiview_report(
+    config,
+    rows: list[tuple[int, str | None, float, float, pathlib.Path]],
+    chunk_size_info: str,
+    timing: TimingBreakdown,
+) -> str:
     lines = [
         "Multi-View Render Report",
         f"input: {config.input}",
@@ -154,6 +211,9 @@ def _format_multiview_report(config, rows: list[tuple[int, str | None, float, fl
         f"render_mode: {config.render_mode}",
         f"chunk_size: {chunk_size_info}",
         f"view_count: {len(rows)}",
+        "",
+        "Timing Summary",
+        *_timing_summary_report_lines(timing),
         "",
         "index | name | elev | azim | output",
     ]
@@ -176,9 +236,16 @@ def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
     logger.reset()
     suffix = _render_all_suffix(config.output)
     render_config = replace(config, display=False, render_all=False)
+    input_path = pathlib.Path(config.input)
     renderer_cache = RendererCache(device=torch.device(f"cuda:{torch.cuda.current_device()}"), logger=logger)
     total_modes = len(RenderModeRenderer.SUPPORTED_MODES)
+    mode_batch_sizes = _render_all_mode_batch_sizes(config, total_modes)
     progress_start = time.perf_counter()
+    session_init_ms = 0.0
+    data_loading_ms = 0.0
+    scene_prepare_ms = 0.0
+    render_ms_total = 0.0
+    save_ms_total = 0.0
     logger.log(
         f"Starting render-all run for {total_modes} mode(s) -> {output_dir}",
         console="always",
@@ -190,50 +257,143 @@ def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
         console_message=f"[Info] Render-All Items: total={total_modes}",
     )
     try:
-        renderer = renderer_cache.get(render_config)
-        prepared = renderer.prepare_scene(pathlib.Path(config.input))
+        init_start = time.perf_counter()
+        renderer, _created = renderer_cache.get_with_status(render_config)
+        if _created:
+            session_init_ms += (time.perf_counter() - init_start) * 1000.0
+        assets_start = time.perf_counter()
+        assets = renderer.prepare_assets(input_path)
+        data_loading_ms += (time.perf_counter() - assets_start) * 1000.0
+        prepare_start = time.perf_counter()
+        prepared = renderer.prepare_view(assets)
+        scene_prepare_ms += (time.perf_counter() - prepare_start) * 1000.0
         outputs = []
         mode_rows: list[tuple[str, pathlib.Path, list[float] | None]] = []
-        for mode in RenderModeRenderer.SUPPORTED_MODES:
-            mode_started = time.perf_counter()
-            image = None
-            mode_output = output_dir / f"{mode}{suffix}"
-            if config.benchmark_requested:
+        if config.benchmark_requested:
+            for mode in RenderModeRenderer.SUPPORTED_MODES:
+                mode_started = time.perf_counter()
+                image = None
+                mode_output = output_dir / f"{mode}{suffix}"
                 for _ in range(config.benchmark_warmup_runs):
-                    renderer.render(pathlib.Path(config.input), render_mode=mode, prepared=prepared)
+                    render_start = time.perf_counter()
+                    renderer.render(input_path, render_mode=mode, prepared=prepared)
+                    render_ms_total += (time.perf_counter() - render_start) * 1000.0
                 timings = []
                 for _ in range(config.benchmark_runs):
                     _cuda_sync()
                     start = time.perf_counter()
-                    image = renderer.render(pathlib.Path(config.input), render_mode=mode, prepared=prepared)
+                    image = renderer.render(input_path, render_mode=mode, prepared=prepared)
                     _cuda_sync()
-                    timings.append((time.perf_counter() - start) * 1000.0)
+                    render_duration_ms = (time.perf_counter() - start) * 1000.0
+                    render_ms_total += render_duration_ms
+                    timings.append(render_duration_ms)
                 mode_rows.append((mode, mode_output, timings))
-            else:
-                image = renderer.render(pathlib.Path(config.input), render_mode=mode, prepared=prepared)
-                mode_rows.append((mode, mode_output, None))
-            renderer.save_image(image, mode_output)
-            outputs.append(mode_output)
-            elapsed_ms = (time.perf_counter() - progress_start) * 1000.0
-            mode_duration_ms = (time.perf_counter() - mode_started) * 1000.0
-            eta_ms = estimate_remaining_ms(len(outputs), total_modes, elapsed_ms)
-            logger.log(
-                f"Completed render-all mode {mode} ({len(outputs)}/{total_modes})",
-                console="always",
-                console_message=_progress_line(
-                    "render-all",
-                    len(outputs),
-                    total_modes,
-                    item_label=mode,
-                    last_ms=mode_duration_ms,
-                    eta_ms=eta_ms,
-                ),
-            )
-        report = _format_render_all_report(config, mode_rows)
+                save_start = time.perf_counter()
+                renderer.save_image(image, mode_output)
+                save_ms_total += (time.perf_counter() - save_start) * 1000.0
+                outputs.append(mode_output)
+                elapsed_ms = (time.perf_counter() - progress_start) * 1000.0
+                mode_duration_ms = (time.perf_counter() - mode_started) * 1000.0
+                eta_ms = estimate_remaining_ms(len(outputs), total_modes, elapsed_ms)
+                logger.log(
+                    f"Completed render-all mode {mode} ({len(outputs)}/{total_modes})",
+                    console="always",
+                    console_message=_progress_line(
+                        "render-all",
+                        len(outputs),
+                        total_modes,
+                        item_label=mode,
+                        last_ms=mode_duration_ms,
+                        eta_ms=eta_ms,
+                    ),
+                )
+        else:
+            mode_index = 0
+            batch_size_index = 0
+            attempted_batch_sizes = [mode_batch_sizes[0]]
+            all_modes = list(RenderModeRenderer.SUPPORTED_MODES)
+            if mode_batch_sizes[0] > 1:
+                logger.log(
+                    f"Render-all mode batching enabled with initial batch size {mode_batch_sizes[0]}.",
+                )
+            while mode_index < total_modes:
+                batch_size = mode_batch_sizes[batch_size_index]
+                batch_modes = all_modes[mode_index: mode_index + batch_size]
+                batch_started = time.perf_counter()
+                try:
+                    render_start = time.perf_counter()
+                    batch_images = renderer.render_prepared_modes(prepared, batch_modes)
+                    render_ms_total += (time.perf_counter() - render_start) * 1000.0
+                except Exception as exc:
+                    if is_cuda_oom(exc) and batch_size_index + 1 < len(mode_batch_sizes):
+                        next_batch_size = mode_batch_sizes[batch_size_index + 1]
+                        logger.log(
+                            f"Render-all batch starting at mode index {mode_index + 1} hit CUDA OOM ({exc!r}); "
+                            f"recreating renderer and retrying with batch size {next_batch_size}."
+                        )
+                        renderer_cache.reset_after_cuda_failure(render_config)
+                        batch_size_index += 1
+                        attempted_batch_sizes.append(next_batch_size)
+                        init_start = time.perf_counter()
+                        renderer, _created = renderer_cache.get_with_status(render_config)
+                        if _created:
+                            session_init_ms += (time.perf_counter() - init_start) * 1000.0
+                        assets_start = time.perf_counter()
+                        assets = renderer.prepare_assets(input_path)
+                        data_loading_ms += (time.perf_counter() - assets_start) * 1000.0
+                        prepare_start = time.perf_counter()
+                        prepared = renderer.prepare_view(assets)
+                        scene_prepare_ms += (time.perf_counter() - prepare_start) * 1000.0
+                        continue
+                    raise
+                batch_duration_ms = (time.perf_counter() - batch_started) * 1000.0
+                avg_mode_duration_ms = batch_duration_ms / max(len(batch_modes), 1)
+                for mode in batch_modes:
+                    mode_output = output_dir / f"{mode}{suffix}"
+                    save_start = time.perf_counter()
+                    renderer.save_image(batch_images[mode], mode_output)
+                    save_ms_total += (time.perf_counter() - save_start) * 1000.0
+                    outputs.append(mode_output)
+                    mode_rows.append((mode, mode_output, None))
+                    elapsed_ms = (time.perf_counter() - progress_start) * 1000.0
+                    eta_ms = estimate_remaining_ms(len(outputs), total_modes, elapsed_ms)
+                    logger.log(
+                        f"Completed render-all mode {mode} ({len(outputs)}/{total_modes})",
+                        console="always",
+                        console_message=_progress_line(
+                            "render-all",
+                            len(outputs),
+                            total_modes,
+                            item_label=mode,
+                            last_ms=avg_mode_duration_ms,
+                            eta_ms=eta_ms,
+                        ),
+                    )
+                mode_index += len(batch_modes)
+            if attempted_batch_sizes[-1] != attempted_batch_sizes[0]:
+                attempted = ",".join(str(size) for size in attempted_batch_sizes[:-1])
+                logger.log(
+                    f"Render-all completed with reduced mode batch size {attempted_batch_sizes[-1]} "
+                    f"(fallback from {attempted})."
+                )
+        timing = TimingBreakdown(
+            total_ms=(time.perf_counter() - progress_start) * 1000.0,
+            session_init_ms=session_init_ms,
+            data_loading_ms=data_loading_ms,
+            scene_prepare_ms=scene_prepare_ms,
+            render_ms=render_ms_total,
+            save_ms=save_ms_total,
+        )
+        report = _format_render_all_report(config, mode_rows, timing)
         report_path = _write_render_all_report(output_dir, report)
         logger.log(report.rstrip())
         logger.log(f"Saved {len(outputs)} render modes under {output_dir}")
         logger.log(f"Saved render-all report to {report_path}")
+        logger.log(
+            f"Render-all timing summary: total_ms={timing.total_ms:.3f}",
+            console="always",
+            console_message=_timing_summary_console_message("Render-All Timing", timing),
+        )
         logger.log(
             f"Finished render-all run -> {report_path}",
             console="always",
@@ -275,24 +435,34 @@ def _render_multiview_chunk(
     output_dir: pathlib.Path,
     suffix: str,
     chunk_specs: list[tuple[int, str | None, float, float]],
-) -> tuple[list[pathlib.Path], list[tuple[int, str | None, float, float, pathlib.Path]]]:
+) -> tuple[list[pathlib.Path], list[tuple[int, str | None, float, float, pathlib.Path]], float, float, float]:
     prepared_rows = []
     rows = []
+    prepare_views_ms = 0.0
+    render_ms = 0.0
+    save_ms = 0.0
     for view_index, label, elev, azim in chunk_specs:
         view_config = replace(base_config, elev=elev, azim=azim)
         output_path = _multi_view_output_path(output_dir, suffix, view_index, elev, azim, label=label)
+        prepare_start = time.perf_counter()
         prepared = renderer.prepare_view(assets, config=view_config)
+        prepare_views_ms += (time.perf_counter() - prepare_start) * 1000.0
         prepared_rows.append((prepared, output_path))
         rows.append((view_index, label, elev, azim, output_path))
+    render_start = time.perf_counter()
     images = [renderer.render_prepared(prepared) for prepared, _output_path in prepared_rows]
+    render_ms += (time.perf_counter() - render_start) * 1000.0
     outputs = []
     for (_prepared, output_path), image in zip(prepared_rows, images):
+        save_start = time.perf_counter()
         outputs.append(renderer.save_image(image, output_path))
-    return outputs, rows
+        save_ms += (time.perf_counter() - save_start) * 1000.0
+    return outputs, rows, prepare_views_ms, render_ms, save_ms
 
 
 def _render_multiview_pass(
     renderer_cache: RendererCache,
+    current_renderer: SceneRenderer,
     assets,
     base_config,
     output_dir: pathlib.Path,
@@ -300,22 +470,37 @@ def _render_multiview_pass(
     view_specs: list[tuple[int, str | None, float, float]],
     chunk_sizes: tuple[int, ...],
     logger: RunLogger,
-) -> tuple[list[pathlib.Path], list[tuple[int, str | None, float, float, pathlib.Path]], list[int], int]:
+) -> tuple[list[pathlib.Path], list[tuple[int, str | None, float, float, pathlib.Path]], list[int], int, float, float, float, float]:
     rows = []
     outputs = []
     attempted_chunk_sizes = [chunk_sizes[0]]
     chunk_size_index = 0
     chunk_start = 0
     progress_start = time.perf_counter()
+    session_init_ms = 0.0
+    prepare_views_ms_total = 0.0
+    render_ms_total = 0.0
+    save_ms_total = 0.0
     while chunk_start < len(view_specs):
         chunk_size = chunk_sizes[chunk_size_index]
         chunk_specs = view_specs[chunk_start: chunk_start + chunk_size]
         chunk_index = (chunk_start // chunk_size) + 1
         chunk_started = time.perf_counter()
         logger.log(f"Rendering multi-view chunk {chunk_index} ({len(chunk_specs)} view(s), chunk size {chunk_size})")
-        renderer = renderer_cache.get(base_config)
+        init_start = time.perf_counter()
+        renderer, _created = renderer_cache.get_with_status(base_config)
+        if _created or renderer is not current_renderer:
+            session_init_ms += (time.perf_counter() - init_start) * 1000.0
+        current_renderer = renderer
         try:
-            chunk_outputs, chunk_rows = _render_multiview_chunk(renderer, assets, base_config, output_dir, suffix, chunk_specs)
+            chunk_outputs, chunk_rows, chunk_prepare_views_ms, chunk_render_ms, chunk_save_ms = _render_multiview_chunk(
+                renderer,
+                assets,
+                base_config,
+                output_dir,
+                suffix,
+                chunk_specs,
+            )
         except Exception as exc:
             if is_cuda_oom(exc) and chunk_size_index + 1 < len(chunk_sizes):
                 next_chunk_size = chunk_sizes[chunk_size_index + 1]
@@ -327,6 +512,7 @@ def _render_multiview_pass(
                 renderer_cache.reset_after_cuda_failure(base_config)
                 chunk_size_index += 1
                 attempted_chunk_sizes.append(next_chunk_size)
+                current_renderer = None
                 logger.log(
                     f"Multi-view fallback to chunk size {next_chunk_size} after CUDA OOM at chunk start {chunk_start:04d}",
                     console="always",
@@ -339,6 +525,9 @@ def _render_multiview_pass(
             raise
         outputs.extend(chunk_outputs)
         rows.extend(chunk_rows)
+        prepare_views_ms_total += chunk_prepare_views_ms
+        render_ms_total += chunk_render_ms
+        save_ms_total += chunk_save_ms
         elapsed_ms = (time.perf_counter() - progress_start) * 1000.0
         chunk_duration_ms = (time.perf_counter() - chunk_started) * 1000.0
         eta_ms = estimate_remaining_ms(len(rows), len(view_specs), elapsed_ms)
@@ -355,7 +544,16 @@ def _render_multiview_pass(
             ),
         )
         chunk_start += len(chunk_specs)
-    return outputs, rows, attempted_chunk_sizes, chunk_sizes[chunk_size_index]
+    return (
+        outputs,
+        rows,
+        attempted_chunk_sizes,
+        chunk_sizes[chunk_size_index],
+        session_init_ms,
+        prepare_views_ms_total,
+        render_ms_total,
+        save_ms_total,
+    )
 
 
 # Standalone multi-view is also sequential: one renderer/context per invocation, no raster thread pool.
@@ -384,9 +582,17 @@ def _render_multiview_from_config(config) -> tuple[list[pathlib.Path], pathlib.P
     base_config = replace(config, display=False)
     chunk_sizes = _multiview_chunk_sizes(base_config)
     renderer_cache = RendererCache(device=torch.device(f"cuda:{torch.cuda.current_device()}"), logger=logger)
+    run_started = time.perf_counter()
+    session_init_ms = 0.0
+    data_loading_ms = 0.0
     try:
-        renderer = renderer_cache.get(base_config)
+        init_start = time.perf_counter()
+        renderer, _created = renderer_cache.get_with_status(base_config)
+        if _created:
+            session_init_ms += (time.perf_counter() - init_start) * 1000.0
+        assets_start = time.perf_counter()
         assets = renderer.prepare_assets(pathlib.Path(config.input))
+        data_loading_ms += (time.perf_counter() - assets_start) * 1000.0
         if config.canonical_six_views:
             logger.log("Using canonical six-view set with sequential chunk rendering and CUDA OOM fallback through chunk sizes 6, 2, 1.")
         else:
@@ -394,8 +600,18 @@ def _render_multiview_from_config(config) -> tuple[list[pathlib.Path], pathlib.P
                 f"Using sequential multi-view chunk rendering with initial chunk size {chunk_sizes[0]} "
                 "and renderer recreation on CUDA OOM."
             )
-        outputs, rows, attempted_chunk_sizes, chunk_size_used = _render_multiview_pass(
+        (
+            outputs,
+            rows,
+            attempted_chunk_sizes,
+            chunk_size_used,
+            extra_session_init_ms,
+            prepare_views_ms_total,
+            render_ms_total,
+            save_ms_total,
+        ) = _render_multiview_pass(
             renderer_cache,
+            renderer,
             assets,
             base_config,
             output_dir,
@@ -404,12 +620,25 @@ def _render_multiview_from_config(config) -> tuple[list[pathlib.Path], pathlib.P
             chunk_sizes=chunk_sizes,
             logger=logger,
         )
+        timing = TimingBreakdown(
+            total_ms=(time.perf_counter() - run_started) * 1000.0,
+            session_init_ms=session_init_ms + extra_session_init_ms,
+            data_loading_ms=data_loading_ms,
+            scene_prepare_ms=prepare_views_ms_total,
+            render_ms=render_ms_total,
+            save_ms=save_ms_total,
+        )
         chunk_size_info = _format_chunk_size_info(attempted_chunk_sizes, chunk_size_used)
-        report = _format_multiview_report(config, rows, chunk_size_info)
+        report = _format_multiview_report(config, rows, chunk_size_info, timing)
         report_path = _write_multiview_report(output_dir, report)
         logger.log(report.rstrip())
         logger.log(f"Saved {len(outputs)} multi-view renders under {output_dir}")
         logger.log(f"Saved multi-view report to {report_path}")
+        logger.log(
+            f"Multi-view timing summary: total_ms={timing.total_ms:.3f}",
+            console="always",
+            console_message=_timing_summary_console_message("Multi-View Timing", timing),
+        )
         logger.log(
             f"Finished multi-view run -> {report_path}",
             console="always",

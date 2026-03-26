@@ -27,6 +27,7 @@ _CACHE_KEY_EXCLUDED_FIELDS = frozenset(
         "canonical_six_views",
         "multi_view_chunk_size",
         "render_all",
+        "render_all_batch_size",
         "display",
         "print_progress",
         "benchmark_requested",
@@ -100,14 +101,18 @@ class RendererCache:
         if renderer is not None:
             renderer.clear_texture_cache()
 
-    def get(self, config: RenderConfig) -> SceneRenderer:
+    def get_with_status(self, config: RenderConfig) -> tuple[SceneRenderer, bool]:
         key = renderer_cache_key(config)
         if self._active_renderer is not None and self._active_key == key:
-            return self._active_renderer
+            return self._active_renderer, False
         self._discard_active_renderer()
         renderer = SceneRenderer(config, device=self.device, environment_service=self._environment_service, logger=self.logger)
         self._active_renderer = renderer
         self._active_key = key
+        return renderer, True
+
+    def get(self, config: RenderConfig) -> SceneRenderer:
+        renderer, _created = self.get_with_status(config)
         return renderer
 
     def clear_texture_caches(self) -> None:

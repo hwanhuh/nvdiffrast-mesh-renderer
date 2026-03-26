@@ -94,6 +94,7 @@ class RenderConfig:
     double_sided_depth_peels: int
     normalize_depth: bool
     render_all: bool
+    render_all_batch_size: int
     canonical_six_views: bool
     multi_view_chunk_size: int
     geometry_preprocess_device: str
@@ -241,6 +242,12 @@ def add_render_arguments(
     parser.add_argument("--normalize-depth", action="store_true", help="Normalize depth outputs across visible pixels for visualization")
     if include_render_all:
         parser.add_argument("--render-all", action="store_true", help="Render every supported mode into a mode-named output directory")
+        parser.add_argument(
+            "--render-all-batch-size",
+            type=int,
+            default=4,
+            help="Maximum number of render-all modes to process per shared geometry pass before saving outputs",
+        )
     if include_canonical_six_views:
         parser.add_argument("--canonical-six-views", action="store_true", help="Render front, back, left, right, top, and bottom views in one multi-view run")
     if include_multi_view_chunk_size:
@@ -329,6 +336,7 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         double_sided_depth_peels=max(int(getattr(args, "double_sided_depth_peels", 4)), 1),
         normalize_depth=bool(getattr(args, "normalize_depth", False)),
         render_all=bool(getattr(args, "render_all", False)),
+        render_all_batch_size=max(int(getattr(args, "render_all_batch_size", 4)), 1),
         canonical_six_views=bool(getattr(args, "canonical_six_views", False)),
         multi_view_chunk_size=max(int(getattr(args, "multi_view_chunk_size", 4)), 1),
         geometry_preprocess_device=str(getattr(args, "geometry_preprocess_device", "auto")),

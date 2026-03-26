@@ -91,6 +91,7 @@ nvdiffrast-mesh-render example_meshes/c7fd79edb639400293683095caafff21_1024.glb 
 ```
 
 This writes one image per mode under `outputs/all_modes/`, plus `render_all_report.txt` and `render_all.log`. If you pass `--benchmark-runs` and/or `--benchmark-warmup-runs`, the same report file also includes timing rows.
+Regular `--render-all` runs reuse one prepared scene and, by default, process up to 4 modes per shared geometry pass. Lower `--render-all-batch-size` if you need a smaller memory footprint; benchmark mode disables batching so per-mode timings stay comparable.
 
 Convenience wrapper for the same workflow:
 
@@ -558,6 +559,7 @@ args = Namespace(
     wireframe_thickness_px=0.5,
     normalize_depth=False,
     render_all=False,
+    render_all_batch_size=4,
 )
 
 config = config_from_args(args)
@@ -569,7 +571,7 @@ SceneRenderer(config).render_to_file()
 - CUDA is mandatory.
 - Only square output resolutions are currently supported.
 - `depth_*`, `triangle_id`, and similar outputs are exported as display-oriented images, not raw float buffers.
-- `--render-all` re-renders the scene once per mode, so it is intended as a validation/inspection workflow rather than the fastest batch path.
+- `--render-all` remains a validation/inspection workflow rather than the multi-GPU batch path. Normal runs batch a few modes per shared geometry pass for speed, while benchmark runs still re-render once per mode for timing fidelity.
 - Multi-view rendering currently cannot be combined with `--render-all`.
 - `--display` is not meaningful for multi-view rendering because the view grid is emitted as files.
 - `--canonical-six-views` cannot be combined with explicit multi-view range flags such as `--azim-start` or `--elev-start`.

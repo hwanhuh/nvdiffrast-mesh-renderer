@@ -37,7 +37,7 @@ class RunLogger:
 
 def format_duration_ms(duration_ms: float | None) -> str:
     if duration_ms is None or not math.isfinite(duration_ms) or duration_ms < 0.0:
-        return "n/a"
+        return "0s"
     if duration_ms < 1000.0:
         return f"{duration_ms:.0f}ms"
     total_seconds = duration_ms / 1000.0

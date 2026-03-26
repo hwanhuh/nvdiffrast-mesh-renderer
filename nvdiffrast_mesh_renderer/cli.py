@@ -182,7 +182,7 @@ def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
     logger.log(
         f"Starting render-all run for {total_modes} mode(s) -> {output_dir}",
         console="always",
-        console_message="[Info] ===Render-All Start: Initializing===",
+        console_message="[Info] Render-All Start: Initializing",
     )
     logger.log(
         f"Render-all total modes: {total_modes}",
@@ -371,7 +371,7 @@ def _render_multiview_from_config(config) -> tuple[list[pathlib.Path], pathlib.P
     logger.log(
         f"Starting multi-view run for {total_views} view(s) -> {output_dir}",
         console="always",
-        console_message="[Info] ===Multi-View Start: Initializing===",
+        console_message="[Info] Multi-View Start: Initializing",
     )
     logger.log(
         f"Multi-view total views: {total_views}",
@@ -467,9 +467,9 @@ def main() -> None:
     logger.reset()
     renderer_cache = RendererCache(device=torch.device(f"cuda:{torch.cuda.current_device()}"), logger=logger)
     render_started = time.perf_counter()
-    logger.log("Starting single render run.", console="always", console_message="[Info] ===Render Start: Initializing===")
+    logger.log("Starting single render run.", console="always", console_message="[Info] Render Start: Initializing")
     try:
-        renderer_cache.get(config).render_to_file()
+        output_path = renderer_cache.get(config).render_to_file()
         duration_ms = (time.perf_counter() - render_started) * 1000.0
         logger.log(
             "Finished single render run.",
@@ -479,7 +479,7 @@ def main() -> None:
         logger.log(
             "Single render completed successfully.",
             console="always",
-            console_message=format_path_notice("Info", "Done. Log file:", logger.path),
+            console_message=format_path_notice("Info", "Done. Output:", output_path),
         )
     except Exception as exc:
         logger.log(f"Single render failed: {type(exc).__name__}: {exc}")

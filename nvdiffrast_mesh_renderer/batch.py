@@ -1310,7 +1310,7 @@ def main() -> None:
     batch_logger.log(
         f"Batch progress initialized for {total_selected} selected row(s).",
         console="always",
-        console_message="[Info] Initializing",
+        console_message="[Info] Batch Start: Initializing",
     )
     batch_logger.log(
         f"Batch total meshes: {total_selected}, workers: {len(gpu_list)}",

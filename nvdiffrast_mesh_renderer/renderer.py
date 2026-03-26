@@ -103,10 +103,10 @@ class SceneRenderer:
         layer_images = []
         for mesh in prepared.meshes:
             mesh_layers = [registry.render(mode, layer, prepared.camera) for layer in self.geometry.render_geometry_pass(mesh, prepared.camera)]
-            if len(mesh_layers) == 2:
+            if len(mesh_layers) == 2 and self.config.double_sided_depth_peels <= 1:
                 layer_images.append(self.compositor.merge_double_sided(mesh_layers[0], mesh_layers[1], mesh.material.alpha_mode))
-            elif mesh_layers:
-                layer_images.append(mesh_layers[0])
+            else:
+                layer_images.extend(mesh_layers)
         final_rgb, final_alpha = self.compositor.composite_mesh_layers(prepared.bg_rgb, prepared.bg_alpha, layer_images)
         return self.postprocessor.postprocess(final_rgb, final_alpha, render_mode=mode)
 

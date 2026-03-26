@@ -48,6 +48,7 @@ BATCH_OVERRIDE_KEYS = frozenset(
         "wireframe_color",
         "wireframe_opacity",
         "wireframe_thickness_px",
+        "double_sided_depth_peels",
         "geometry_preprocess_device",
         "geometry_cuda_threshold_faces",
         "geometry_cuda_threshold_vertices",
@@ -89,6 +90,7 @@ class RenderConfig:
     wireframe_color: np.ndarray
     wireframe_opacity: float
     wireframe_thickness_px: float
+    double_sided_depth_peels: int
     normalize_depth: bool
     render_all: bool
     canonical_six_views: bool
@@ -229,6 +231,12 @@ def add_render_arguments(
     parser.add_argument("--wireframe-color", default="0.2,1.0,0.25", help="Wireframe overlay color as r,g,b in 0-1 range")
     parser.add_argument("--wireframe-opacity", type=float, default=1.0, help="Wireframe overlay opacity multiplier")
     parser.add_argument("--wireframe-thickness-px", type=float, default=0.5, help="Wireframe thickness in pixels")
+    parser.add_argument(
+        "--double-sided-depth-peels",
+        type=int,
+        default=4,
+        help="Maximum depth layers to peel per winding bucket for double-sided meshes. Use 1 to disable depth peeling.",
+    )
     parser.add_argument("--normalize-depth", action="store_true", help="Normalize depth outputs across visible pixels for visualization")
     if include_render_all:
         parser.add_argument("--render-all", action="store_true", help="Render every supported mode into a mode-named output directory")
@@ -315,6 +323,7 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         wireframe_color=parse_rgb(getattr(args, "wireframe_color", "0.2,1.0,0.25")),
         wireframe_opacity=float(np.clip(getattr(args, "wireframe_opacity", 1.0), 0.0, 1.0)),
         wireframe_thickness_px=max(float(getattr(args, "wireframe_thickness_px", 0.5)), 0.0),
+        double_sided_depth_peels=max(int(getattr(args, "double_sided_depth_peels", 4)), 1),
         normalize_depth=bool(getattr(args, "normalize_depth", False)),
         render_all=bool(getattr(args, "render_all", False)),
         canonical_six_views=bool(getattr(args, "canonical_six_views", False)),
@@ -371,6 +380,9 @@ def config_with_overrides(base_config: RenderConfig, overrides: dict[str, Any]) 
             continue
         if key in {"resolution", "env_diffuse_samples", "geometry_cuda_threshold_faces", "geometry_cuda_threshold_vertices"}:
             updates[key] = int(value)
+            continue
+        if key == "double_sided_depth_peels":
+            updates[key] = max(int(value), 1)
             continue
         if key == "normalize_depth":
             updates[key] = bool(value)

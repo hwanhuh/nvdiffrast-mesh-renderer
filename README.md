@@ -144,6 +144,8 @@ nvdiffrast-mesh-render-batch \
 
 Batch mode runs one long-lived worker process per GPU. Each worker reuses one `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context for sequential rendering, clears texture caches between jobs, and recreates the renderer/context before retrying after CUDA OOM or other CUDA failures.
 
+Double-sided meshes default to bounded depth peeling with up to 4 layers per winding bucket. Reduce or disable it with `--double-sided-depth-peels 1` if you need the older single-layer front/back behavior.
+
 ## Render Modes
 
 Supported `--render-mode` values:
@@ -213,6 +215,7 @@ Shading / visualization:
 - `--wireframe-color`
 - `--wireframe-opacity`
 - `--wireframe-thickness-px`
+- `--double-sided-depth-peels`
 - `--normalize-depth`
 
 Quality / visibility:

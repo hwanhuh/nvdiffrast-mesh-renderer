@@ -17,24 +17,55 @@ class GeometryPassRenderer:
 
     def render_geometry_pass(self, mesh: MeshData, camera: CameraData) -> List[RenderLayer]:
         clip_pos = torch.matmul(mesh.positions_h, camera.mvp.t()).contiguous()
+        clip_pos_batch = clip_pos.unsqueeze(0)
         view_attr = torch.matmul(mesh.positions_h, camera.view.t())[:, :3].contiguous()
         front_tri, front_normals, back_tri, back_normals = self._split_triangles_by_facing(mesh.faces, mesh.face_normals, clip_pos)
         cull_backfaces = self.config.cull_mode == "force" or (self.config.cull_mode == "auto" and not mesh.material.double_sided)
-        layers = []
-        front = self._render_layer(mesh, camera, clip_pos, view_attr, front_tri, front_normals, side="front")
-        if front is not None:
-            layers.append(front)
+        front_layer_limit = 1 if cull_backfaces else self.config.double_sided_depth_peels
+        layers = self._render_side_layers(mesh, camera, clip_pos_batch, view_attr, front_tri, front_normals, side="front", max_layers=front_layer_limit)
         if not cull_backfaces:
-            back = self._render_layer(mesh, camera, clip_pos, view_attr, back_tri, back_normals, side="back")
-            if back is not None:
-                layers.append(back)
+            layers.extend(self._render_side_layers(mesh, camera, clip_pos_batch, view_attr, back_tri, back_normals, side="back", max_layers=self.config.double_sided_depth_peels))
+        return layers
+
+    def _render_side_layers(
+        self,
+        mesh: MeshData,
+        camera: CameraData,
+        clip_pos_batch: torch.Tensor,
+        view_attr: torch.Tensor,
+        tri: torch.Tensor,
+        face_normals: torch.Tensor,
+        side: str,
+        max_layers: int,
+    ) -> List[RenderLayer]:
+        if tri.shape[0] == 0:
+            return []
+        tri = tri.contiguous()
+        if max_layers <= 1:
+            layer = self._render_layer(mesh, camera, clip_pos_batch, view_attr, tri, face_normals, side)
+            return [] if layer is None else [layer]
+        layers: List[RenderLayer] = []
+        # Peel sequential depth layers within one winding bucket so self-occluding double-sided shells can contribute more than one surface.
+        with dr.DepthPeeler(
+            self.glctx,
+            clip_pos_batch,
+            tri,
+            [self.config.resolution, self.config.resolution],
+            grad_db=False,
+        ) as peeler:
+            for _ in range(max_layers):
+                rast, rast_db = peeler.rasterize_next_layer()
+                layer = self._build_layer_from_raster(mesh, camera, clip_pos_batch, view_attr, tri, face_normals, side, rast, rast_db)
+                if layer is None:
+                    break
+                layers.append(layer)
         return layers
 
     def _render_layer(
         self,
         mesh: MeshData,
         camera: CameraData,
-        clip_pos: torch.Tensor,
+        clip_pos_batch: torch.Tensor,
         view_attr: torch.Tensor,
         tri: torch.Tensor,
         face_normals: torch.Tensor,
@@ -42,8 +73,21 @@ class GeometryPassRenderer:
     ) -> Optional[RenderLayer]:
         if tri.shape[0] == 0:
             return None
-        clip_pos_batch = clip_pos.unsqueeze(0)
         rast, rast_db = self._rasterize_triangles(clip_pos_batch, tri)
+        return self._build_layer_from_raster(mesh, camera, clip_pos_batch, view_attr, tri, face_normals, side, rast, rast_db)
+
+    def _build_layer_from_raster(
+        self,
+        mesh: MeshData,
+        camera: CameraData,
+        clip_pos_batch: torch.Tensor,
+        view_attr: torch.Tensor,
+        tri: torch.Tensor,
+        face_normals: torch.Tensor,
+        side: str,
+        rast: torch.Tensor,
+        rast_db: Optional[torch.Tensor],
+    ) -> Optional[RenderLayer]:
         valid = rast[..., 3:] > 0
         if not valid.any():
             return None
@@ -91,20 +135,19 @@ class GeometryPassRenderer:
 
     def render_wireframe_pass(self, layer: RenderLayer) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         gbuf = layer.geometry
-        if gbuf.tri.shape[0] == 0:
-            shape = (1, self.config.resolution, self.config.resolution, 1)
-            empty = torch.zeros(shape, dtype=gbuf.rast.dtype, device=gbuf.rast.device)
-            return empty, None, empty.bool(), None, torch.zeros(shape[:-1] + (3,), dtype=gbuf.rast.dtype, device=gbuf.rast.device)
-        expanded_clip = gbuf.clip_pos[:, gbuf.tri.reshape(-1).long(), :].contiguous()
-        tri_count = gbuf.tri.shape[0]
-        wire_tri = torch.arange(tri_count * 3, device=gbuf.tri.device, dtype=gbuf.tri.dtype).reshape(tri_count, 3).contiguous()
-        corner_bary = torch.eye(3, dtype=gbuf.rast.dtype, device=gbuf.rast.device).repeat(tri_count, 1).contiguous()
-        rast, rast_db = self._rasterize_triangles(expanded_clip, wire_tri)
-        valid = rast[..., 3:] > 0
+        valid = gbuf.valid
         if not valid.any():
-            return rast, rast_db, valid, None, torch.zeros_like(rast[..., :3])
-        bary, bary_db = dr.interpolate(corner_bary, rast, wire_tri, rast_db=rast_db, diff_attrs="all")
-        return rast, rast_db, valid, bary_db, bary
+            return gbuf.rast, gbuf.rast_db, valid, None, torch.zeros_like(gbuf.barycentric)
+        if gbuf.rast_db is None:
+            return gbuf.rast, gbuf.rast_db, valid, None, gbuf.barycentric
+        du_dx = gbuf.rast_db[..., 0:1]
+        du_dy = gbuf.rast_db[..., 1:2]
+        dv_dx = gbuf.rast_db[..., 2:3]
+        dv_dy = gbuf.rast_db[..., 3:4]
+        dw_dx = -(du_dx + dv_dx)
+        dw_dy = -(du_dy + dv_dy)
+        bary_db = torch.cat([du_dx, du_dy, dv_dx, dv_dy, dw_dx, dw_dy], dim=-1).contiguous()
+        return gbuf.rast, gbuf.rast_db, valid, bary_db, gbuf.barycentric
 
     def _split_triangles_by_facing(
         self,

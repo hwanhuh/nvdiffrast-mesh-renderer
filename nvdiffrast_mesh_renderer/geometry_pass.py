@@ -19,7 +19,12 @@ class GeometryPassRenderer:
         clip_pos = torch.matmul(mesh.positions_h, camera.mvp.t()).contiguous()
         clip_pos_batch = clip_pos.unsqueeze(0)
         view_attr = torch.matmul(mesh.positions_h, camera.view.t())[:, :3].contiguous()
-        front_tri, front_normals, back_tri, back_normals = self._split_triangles_by_facing(mesh.faces, mesh.face_normals, clip_pos)
+        front_tri, front_normals, back_tri, back_normals = self._split_triangles_by_facing(
+            mesh.faces,
+            mesh.positions,
+            mesh.face_normals,
+            camera.position,
+        )
         cull_backfaces = self.config.cull_mode == "force" or (self.config.cull_mode == "auto" and not mesh.material.double_sided)
         front_layer_limit = 1 if cull_backfaces else self.config.double_sided_depth_peels
         layers = self._render_side_layers(mesh, camera, clip_pos_batch, view_attr, front_tri, front_normals, side="front", max_layers=front_layer_limit)
@@ -152,15 +157,13 @@ class GeometryPassRenderer:
     def _split_triangles_by_facing(
         self,
         faces: torch.Tensor,
+        positions: torch.Tensor,
         face_normals: torch.Tensor,
-        clip_pos: torch.Tensor,
+        camera_position: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        tri_clip = clip_pos[faces]
-        w = torch.where(torch.abs(tri_clip[..., 3:4]) < 1e-8, torch.full_like(tri_clip[..., 3:4], 1e-8), tri_clip[..., 3:4])
-        tri_ndc_xy = tri_clip[..., :2] / w
-        e1 = tri_ndc_xy[:, 1] - tri_ndc_xy[:, 0]
-        e2 = tri_ndc_xy[:, 2] - tri_ndc_xy[:, 0]
-        front_mask = (e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]) >= 0.0
+        tri_centroids = positions[faces].mean(dim=1)
+        view_dir = camera_position.view(1, 3) - tri_centroids
+        front_mask = torch.sum(face_normals * view_dir, dim=-1) >= 0.0
         if front_mask.all():
             return faces, face_normals, faces.new_zeros((0, 3)), face_normals.new_zeros((0, 3))
         if (~front_mask).all():

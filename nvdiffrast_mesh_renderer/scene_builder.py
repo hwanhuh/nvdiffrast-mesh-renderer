@@ -77,12 +77,21 @@ class SceneBuilder:
 
     def build_camera(self, meshes: Sequence[MeshData], config: RenderConfig) -> CameraData:
         center, radius = scene_bounds(meshes)
-        return self.build_camera_from_bounds(center, radius, config)
+        eye, target, _distance = orbit_camera(center, radius, config.elev, config.azim, config.fov, config.distance_scale, config.distance)
+        view = look_at(eye, target, np.array([0.0, 1.0, 0.0], dtype=np.float32))
+        near, far = self._clip_planes_from_meshes(meshes, view)
+        proj = perspective(config.fov, 1.0, near, far)
+        return CameraData(
+            view=torch.as_tensor(view, dtype=torch.float32, device=self.device),
+            proj=torch.as_tensor(proj, dtype=torch.float32, device=self.device),
+            mvp=torch.as_tensor(proj @ view, dtype=torch.float32, device=self.device),
+            position=torch.as_tensor(eye, dtype=torch.float32, device=self.device),
+            cam_to_world=torch.as_tensor(np.linalg.inv(view), dtype=torch.float32, device=self.device),
+        )
 
     def build_camera_from_bounds(self, center: np.ndarray, radius: float, config: RenderConfig) -> CameraData:
         eye, target, distance = orbit_camera(center, radius, config.elev, config.azim, config.fov, config.distance_scale, config.distance)
-        near = max(0.01, distance - radius * 2.5)
-        far = distance + radius * 2.5
+        near, far = self._clip_planes_from_depth_range(distance - radius, distance + radius)
         view = look_at(eye, target, np.array([0.0, 1.0, 0.0], dtype=np.float32))
         proj = perspective(config.fov, 1.0, near, far)
         return CameraData(
@@ -148,3 +157,28 @@ class SceneBuilder:
         self._geometry_preprocess_device = config.geometry_preprocess_device
         self._geometry_cuda_threshold_faces = config.geometry_cuda_threshold_faces
         self._geometry_cuda_threshold_vertices = config.geometry_cuda_threshold_vertices
+
+    def _clip_planes_from_meshes(self, meshes: Sequence[MeshData], view: np.ndarray) -> tuple[float, float]:
+        view_t = torch.as_tensor(view, dtype=torch.float32, device=self.device)
+        positive_depth_min = None
+        positive_depth_max = None
+        for mesh in meshes:
+            view_pos = torch.matmul(mesh.positions_h, view_t.t())[:, 2]
+            depth = -view_pos
+            visible_depth = depth[depth > 0.0]
+            if visible_depth.numel() == 0:
+                continue
+            current_min = float(visible_depth.min().item())
+            current_max = float(visible_depth.max().item())
+            positive_depth_min = current_min if positive_depth_min is None else min(positive_depth_min, current_min)
+            positive_depth_max = current_max if positive_depth_max is None else max(positive_depth_max, current_max)
+        if positive_depth_min is None or positive_depth_max is None:
+            return 0.01, 1.0
+        return self._clip_planes_from_depth_range(positive_depth_min, positive_depth_max)
+
+    def _clip_planes_from_depth_range(self, depth_min: float, depth_max: float) -> tuple[float, float]:
+        depth_min = max(float(depth_min), 1e-3)
+        depth_max = max(float(depth_max), depth_min + 1e-3)
+        near = max(0.01, depth_min * 0.95)
+        far = max(near + 1.0, depth_max * 1.05)
+        return near, far

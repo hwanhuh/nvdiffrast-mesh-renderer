@@ -100,7 +100,7 @@ class SceneRenderer:
 
     def prepare_view(self, assets: PreparedAssets, config: RenderConfig | None = None) -> PreparedScene:
         current_config = self.config if config is None else config
-        camera = self.scene_builder.build_camera_from_bounds(assets.center, assets.radius, current_config)
+        camera = self.scene_builder.build_camera(assets.meshes, current_config)
         bg_rgb, bg_alpha = self.environment.render_background(camera, current_config, assets.env, self.device)
         return PreparedScene(
             meshes=assets.meshes,

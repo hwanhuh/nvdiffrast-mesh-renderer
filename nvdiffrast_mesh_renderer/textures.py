@@ -1,5 +1,6 @@
 import pathlib
 import subprocess
+import weakref
 from typing import Optional
 
 import cv2
@@ -55,7 +56,27 @@ def mip_level_count(height: int, width: int) -> int:
 class TextureCache:
     def __init__(self, device: torch.device):
         self.device = device
-        self._cache = {}
+        self._cache: dict[tuple[str, int, bool, object], tuple[weakref.ReferenceType[object], GpuTexture]] = {}
+
+    def _cache_key(self, kind: str, source: object, srgb: bool, variant: object) -> tuple[str, int, bool, object]:
+        return (kind, id(source), srgb, variant)
+
+    def _get_cached(self, key: tuple[str, int, bool, object], source: object) -> Optional[GpuTexture]:
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        source_ref, texture = entry
+        if source_ref() is not source:
+            self._cache.pop(key, None)
+            return None
+        return texture
+
+    def _store_cached(self, key: tuple[str, int, bool, object], source: object, texture: GpuTexture) -> GpuTexture:
+        def _remove(_ref: weakref.ReferenceType[object], *, cache=self._cache, cache_key=key) -> None:
+            cache.pop(cache_key, None)
+
+        self._cache[key] = (weakref.ref(source, _remove), texture)
+        return texture
 
     def _make_texture(self, array: np.ndarray, srgb: bool) -> GpuTexture:
         array = np.flip(array[..., None] if array.ndim == 2 else array, axis=0).copy()
@@ -71,16 +92,21 @@ class TextureCache:
     def get_pil(self, image: Optional[Image.Image], srgb: bool, mode: str) -> Optional[GpuTexture]:
         if image is None:
             return None
-        key = ("pil", id(image), srgb, mode)
-        if key not in self._cache:
-            self._cache[key] = self._make_texture(image_to_numpy(image, mode=mode), srgb=srgb)
-        return self._cache[key]
+        key = self._cache_key("pil", image, srgb, mode)
+        cached = self._get_cached(key, image)
+        if cached is not None:
+            return cached
+        return self._store_cached(key, image, self._make_texture(image_to_numpy(image, mode=mode), srgb=srgb))
 
     def get_array(self, array: np.ndarray, srgb: bool = False) -> GpuTexture:
-        key = ("array", id(array), srgb, tuple(array.shape))
-        if key not in self._cache:
-            self._cache[key] = self._make_texture(array, srgb=srgb)
-        return self._cache[key]
+        key = self._cache_key("array", array, srgb, tuple(array.shape))
+        cached = self._get_cached(key, array)
+        if cached is not None:
+            return cached
+        return self._store_cached(key, array, self._make_texture(array, srgb=srgb))
+
+    def clear(self) -> None:
+        self._cache.clear()
 
 
 def sample_texture(

@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # `pip install <clone_dir> --no-build-isolation`; see `scripts/install_nvdiffrast.sh`.
 [project]
 name = "nvdiffrast_mesh_renderer"
-version = "0.1.0"
+version = "0.1.1"
 description = "CUDA + nvdiffrast based GLB/GLTF mesh renderer"
 authors = [
     { name = "Hwan Heo", email = "gjghks950@naver.com" },
@@ -26,7 +26,7 @@ classifiers = [
 ]
 dependencies = [
     "imageio>=2.31",
-    "numpy>=1.24",
+    "numpy==1.26.4",
     "opencv-python-headless>=4.8",
     "Pillow>=10.0",
     "trimesh>=4.0",
@@ -42,6 +42,7 @@ display = [
 nvdiffrast-mesh-render = "nvdiffrast_mesh_renderer.cli:main"
 nvdiffrast-mesh-render-all = "nvdiffrast_mesh_renderer.cli:render_all_modes"
 nvdiffrast-mesh-render-multi-view = "nvdiffrast_mesh_renderer.cli:render_multi_view"
+nvdiffrast-mesh-render-batch = "nvdiffrast_mesh_renderer.batch:main"
 
 [tool.setuptools.packages.find]
 include = ["nvdiffrast_mesh_renderer*"]

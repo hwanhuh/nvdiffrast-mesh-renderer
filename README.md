@@ -32,6 +32,7 @@ Installed CLI entrypoints:
 - `nvdiffrast-mesh-render`
 - `nvdiffrast-mesh-render-all`
 - `nvdiffrast-mesh-render-multi-view`
+- `nvdiffrast-mesh-render-batch`
 
 You can also invoke the main CLI as a module:
 
@@ -124,6 +125,18 @@ nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff2
 
 This writes `front`, `back`, `left`, `right`, `top`, and `bottom` view images into the output directory. In this mode the renderer first tries one chunk of 6 views, and if that hits CUDA OOM it retries automatically with chunk size 2.
 
+Manifest-driven batch render:
+
+```bash
+nvdiffrast-mesh-render-batch \
+    --manifest example_meshes/test_manifest.jsonl \
+    --output-root outputs/batch \
+    --gpus 0 \
+    --view-chunk-sizes 24,8,4,2,1
+```
+
+Batch mode runs one long-lived worker process per GPU. Each worker reuses one `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context for sequential rendering, clears texture caches between jobs, and recreates the renderer/context before retrying after CUDA OOM.
+
 ## Render Modes
 
 Supported `--render-mode` values:
@@ -210,7 +223,7 @@ Large-scale preprocessing:
 ## Project Overview
 
 This is a CUDA + `nvdiffrast` based GLB/GLTF renderer. The current implementation is organized around a shared geometry pass plus a multi-mode render dispatcher, while preserving the earlier projected-winding front/back classification and premultiplied-alpha compositing fixes.
-The installable package is `nvdiffrast_mesh_renderer`, exposed via `nvdiffrast-mesh-render`, `nvdiffrast-mesh-render-all`, `nvdiffrast-mesh-render-multi-view`, and `python -m nvdiffrast_mesh_renderer`. The repository-level `render_glb.py`, `render_all_modes.py`, and `render_multi_view.py` remain as thin wrappers around the package.
+The installable package is `nvdiffrast_mesh_renderer`, exposed via `nvdiffrast-mesh-render`, `nvdiffrast-mesh-render-all`, `nvdiffrast-mesh-render-multi-view`, `nvdiffrast-mesh-render-batch`, and `python -m nvdiffrast_mesh_renderer`. The repository-level `render_glb.py`, `render_all_modes.py`, and `render_multi_view.py` remain as thin wrappers around the package.
 
 ## Current Features
 
@@ -229,10 +242,43 @@ The installable package is `nvdiffrast_mesh_renderer`, exposed via `nvdiffrast-m
 - Analytic barycentric wireframe rendering
 - `beauty_plus_wireframe` overlay composition
 - Single render, render-all, and multi-view CLI flows
+- Manifest-driven batch rendering with one worker process per GPU
+- Long-lived batch workers that reuse one `SceneRenderer` / CUDA rasterizer context per GPU
+- Per-job texture-cache cleanup and renderer recreation on CUDA OOM before retry
 - Chunked multi-view rendering across azimuth/elevation grids with per-chunk parallel execution
 - Canonical six-view rendering with `front/back/left/right/top/bottom` presets and `6 -> 2` CUDA OOM fallback
 - Faster scene loading by iterating scene graph instances directly instead of `scene.dump(concatenate=False)`
 - Automatic CUDA geometry preprocessing for large meshes to speed up face-normal and tangent generation
+
+## Batch Worker Model
+
+Batch rendering is intentionally conservative about CUDA context ownership:
+
+- one worker process owns one GPU
+- one worker reuses one `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context across many jobs
+- rendering inside a worker is sequential, not multithreaded, so one CUDA rasterizer context is never shared across concurrent threads
+- worker-local texture caches are cleared between jobs so mesh/material textures do not accumulate indefinitely across a long batch run
+- if a render attempt hits CUDA OOM, the worker drops the current renderer/context, releases cache state, and recreates the renderer before retrying with the next smaller chunk size
+
+This is the operating model to preserve when extending the batch path.
+
+## CUDA Context And Memory Notes
+
+`nvdiffrast`'s CUDA rasterizer is suitable for a long-lived per-GPU worker, but a few design details matter:
+
+- the internal rasterizer keeps reusable work buffers that grow to the largest workload seen so far; this is expected high-watermark memory, not necessarily a leak
+- those internal buffers belong to the live rasterizer context, so keeping one context alive can keep that peak allocation alive as well
+- one `RasterizeCudaContext` should be treated as single-owner state; do not share it across concurrent threads or unrelated render tasks
+- `torch.cuda.empty_cache()` only releases PyTorch allocator cache; it does not destroy `nvdiffrast` internal allocations that are still owned by a live rasterizer context
+- after CUDA OOM or other low-level CUDA failures, it is safer to recreate the renderer/context than to assume the old context is still healthy
+
+In practice, application-level caches are a more likely source of long-running memory growth than `nvdiffrast` itself. The main risk areas are:
+
+- texture caches that retain per-job GPU textures after the job has finished
+- persistent references to prepared scenes, meshes, mip stacks, or antialias topology hashes
+- retry paths that keep using a renderer/context after CUDA OOM instead of rebuilding it
+
+When adding new batch features, keep caches job-scoped unless there is a deliberate eviction strategy, and prefer recreating worker-local renderer state after CUDA failures.
 
 ## Repository Layout
 
@@ -257,6 +303,7 @@ nvdiffrast_renderer/
 │   ├── geometry_utils.py            # Tangents, normals, bounds helpers
 │   ├── math_utils.py                # Shared math helpers
 │   ├── postprocess.py               # Tone mapping and image output
+│   ├── batch.py                     # Manifest-driven multi-GPU batch CLI
 │   └── types.py                     # Shared dataclass contracts
 ├── example_meshes/                  # Sample GLBs used for validation
 ├── envmaps/                         # Sample HDR/EXR environment maps

@@ -66,6 +66,9 @@ class SceneRenderer:
         self.compositor = LayerCompositor()
         self.postprocessor = ImagePostprocessor(config)
 
+    def clear_texture_cache(self) -> None:
+        self.cache.clear()
+
     def prepare_assets(self, input_path: pathlib.Path) -> PreparedAssets:
         meshes = self.scene_builder.load_meshes(input_path)
         if not meshes:

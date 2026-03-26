@@ -4,6 +4,44 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
 import pathlib
+import shutil
+import sys
+
+_ACTIVE_PROGRESS_WIDTH = 0
+
+
+def _stdout_supports_live_updates() -> bool:
+    stream = sys.stdout
+    return hasattr(stream, "isatty") and stream.isatty()
+
+
+def _clear_active_progress_line() -> None:
+    global _ACTIVE_PROGRESS_WIDTH
+    if _ACTIVE_PROGRESS_WIDTH <= 0:
+        return
+    sys.stdout.write("\r" + (" " * _ACTIVE_PROGRESS_WIDTH) + "\r")
+    sys.stdout.flush()
+    _ACTIVE_PROGRESS_WIDTH = 0
+
+
+def _print_console_message(message: str, *, progress: bool) -> None:
+    global _ACTIVE_PROGRESS_WIDTH
+    text = message if message.endswith("\n") else f"{message}\n"
+    if not _stdout_supports_live_updates():
+        print(text, end="")
+        return
+    if progress:
+        width = max(shutil.get_terminal_size(fallback=(120, 20)).columns - 1, 1)
+        line = " ".join(part for part in text.rstrip("\n").splitlines() if part)
+        rendered = line[:width]
+        padding = max(_ACTIVE_PROGRESS_WIDTH - len(rendered), 0)
+        sys.stdout.write("\r" + rendered + (" " * padding))
+        sys.stdout.flush()
+        _ACTIVE_PROGRESS_WIDTH = len(rendered)
+        return
+    _clear_active_progress_line()
+    sys.stdout.write(text)
+    sys.stdout.flush()
 
 
 @dataclass(frozen=True)
@@ -32,7 +70,7 @@ class RunLogger:
         should_print = console == "always" or (console == "echo" and self.echo)
         if should_print:
             rendered = text if console_message is None else (console_message if console_message.endswith("\n") else f"{console_message}\n")
-            print(rendered, end="")
+            _print_console_message(rendered, progress=rendered.startswith("[Progress]"))
 
 
 def format_duration_ms(duration_ms: float | None) -> str:

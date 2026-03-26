@@ -111,7 +111,7 @@ nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff2
     --multi-view-chunk-size 4
 ```
 
-This writes one image per view under `outputs/multiview/` plus a `multiview_report.txt` manifest. If `--output` has an extension, the stem is used as the output directory. If it has no extension, that path is treated as the output directory directly.
+This writes one image per view under `outputs/multiview/` plus a `multiview_report.txt` manifest. The multi-view CLI reuses one `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context sequentially for the whole run, stages up to `--multi-view-chunk-size` views per chunk, and recreates the renderer/context before retrying with a smaller chunk size after CUDA OOM. If `--output` has an extension, the stem is used as the output directory. If it has no extension, that path is treated as the output directory directly.
 
 Canonical six-view render:
 
@@ -123,7 +123,7 @@ nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff2
     --canonical-six-views
 ```
 
-This writes `front`, `back`, `left`, `right`, `top`, and `bottom` view images into the output directory. In this mode the renderer first tries one chunk of 6 views, and if that hits CUDA OOM it retries automatically with chunk size 2.
+This writes `front`, `back`, `left`, `right`, `top`, and `bottom` view images into the output directory. In this mode the renderer first tries one chunk of 6 views, and if that hits CUDA OOM it recreates the renderer/context and retries with chunk sizes 2 and then 1 if needed.
 
 Manifest-driven batch render:
 
@@ -135,7 +135,7 @@ nvdiffrast-mesh-render-batch \
     --view-chunk-sizes 24,8,4,2,1
 ```
 
-Batch mode runs one long-lived worker process per GPU. Each worker reuses one `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context for sequential rendering, clears texture caches between jobs, and recreates the renderer/context before retrying after CUDA OOM.
+Batch mode runs one long-lived worker process per GPU. Each worker reuses one `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context for sequential rendering, clears texture caches between jobs, and recreates the renderer/context before retrying after CUDA OOM or other CUDA failures.
 
 ## Render Modes
 

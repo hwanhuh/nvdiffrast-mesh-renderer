@@ -235,7 +235,7 @@ def add_render_arguments(
     if include_canonical_six_views:
         parser.add_argument("--canonical-six-views", action="store_true", help="Render front, back, left, right, top, and bottom views in one multi-view run")
     if include_multi_view_chunk_size:
-        parser.add_argument("--multi-view-chunk-size", type=int, default=4, help="Maximum number of multi-view jobs to run concurrently per chunk")
+        parser.add_argument("--multi-view-chunk-size", type=int, default=4, help="Maximum number of views to stage per sequential multi-view chunk")
     parser.add_argument(
         "--geometry-preprocess-device",
         choices=GEOMETRY_PREPROCESS_DEVICE_CHOICES,

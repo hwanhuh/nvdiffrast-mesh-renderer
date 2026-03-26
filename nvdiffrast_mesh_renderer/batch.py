@@ -1,6 +1,5 @@
 import argparse
 import csv
-import gc
 import hashlib
 import json
 import multiprocessing as mp
@@ -19,6 +18,7 @@ import torch
 from PIL import Image
 
 from .config import RenderConfig, add_render_arguments, config_from_args, config_with_overrides
+from .lifecycle import RendererCache, is_cuda_failure, is_cuda_oom
 from .renderer import SceneRenderer
 
 CANONICAL_SIX_VIEW_SPECS = (
@@ -687,74 +687,6 @@ def _skip_reason(conn: sqlite3.Connection, job: JobSpec) -> str | None:
     return None
 
 
-def _is_cuda_oom(exc: BaseException) -> bool:
-    seen = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, torch.cuda.OutOfMemoryError):
-            return True
-        if "out of memory" in str(current).lower():
-            return True
-        current = current.__cause__ or current.__context__
-    return False
-
-
-def _is_cuda_failure(exc: BaseException) -> bool:
-    seen = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        message = str(current).lower()
-        if isinstance(current, torch.cuda.OutOfMemoryError):
-            return True
-        if "cuda error" in message or "cuda runtime error" in message or "out of memory" in message:
-            return True
-        current = current.__cause__ or current.__context__
-    return False
-
-
-def _config_cache_key(config: RenderConfig) -> str:
-    excluded = {"input", "output", "elev", "azim", "elev_start", "elev_end", "elev_step", "azim_start", "azim_end", "azim_step", "canonical_six_views", "multi_view_chunk_size", "render_all", "display", "benchmark_requested", "benchmark_runs", "benchmark_warmup_runs"}
-    payload = {
-        key: _json_ready(value)
-        for key, value in config.__dict__.items()
-        if key not in excluded
-    }
-    return json.dumps(payload, sort_keys=True)
-
-
-def _renderer_for_config(
-    cache: dict[str, SceneRenderer],
-    config: RenderConfig,
-    gpu_index: int,
-) -> SceneRenderer:
-    key = _config_cache_key(config)
-    renderer = cache.get(key)
-    if renderer is None:
-        renderer = SceneRenderer(config, device=torch.device(f"cuda:{gpu_index}"))
-        cache[key] = renderer
-    return renderer
-
-
-def _drop_renderer_for_config(cache: dict[str, SceneRenderer], config: RenderConfig) -> None:
-    renderer = cache.pop(_config_cache_key(config), None)
-    if renderer is not None:
-        renderer.clear_texture_cache()
-
-
-def _clear_renderer_caches(cache: dict[str, SceneRenderer]) -> None:
-    for renderer in cache.values():
-        renderer.clear_texture_cache()
-
-
-def _release_worker_memory(cache: dict[str, SceneRenderer]) -> None:
-    _clear_renderer_caches(cache)
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
 def _view_config_for_job(job: JobSpec, view: ViewSpec) -> RenderConfig:
     return replace(
         job.render_config,
@@ -955,7 +887,7 @@ def _write_failed_job_report_if_needed(
     _write_json(temp_output_dir / "job_report.json", report)
 
 
-def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: dict[str, SceneRenderer], worker_slot: int) -> dict[str, Any]:
+def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, worker_slot: int) -> dict[str, Any]:
     torch.cuda.set_device(gpu_index)
     worker_id = f"worker-{worker_slot}-gpu{gpu_index}"
     output_dir = pathlib.Path(job.output_dir)
@@ -977,8 +909,8 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: dict[str, SceneRe
         if output_dir.exists() and job.overwrite in {"all", "failed"}:
             _remove_path(output_dir)
         output_dir.parent.mkdir(parents=True, exist_ok=True)
-        _clear_renderer_caches(renderer_cache)
-        renderer = _renderer_for_config(renderer_cache, job.render_config, gpu_index)
+        renderer_cache.clear_texture_caches()
+        renderer = renderer_cache.get(job.render_config)
         prepare_start = time.perf_counter()
         assets = renderer.prepare_assets(pathlib.Path(job.input_path))
         prepare_assets_ms = (time.perf_counter() - prepare_start) * 1000.0
@@ -999,13 +931,15 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: dict[str, SceneRe
                 break
             except Exception as exc:
                 last_exc = exc
-                if _is_cuda_oom(exc) and chunk_size != job.view_chunk_sizes[-1]:
+                if is_cuda_oom(exc) and chunk_size != job.view_chunk_sizes[-1]:
                     oom_retries += 1
-                    _drop_renderer_for_config(renderer_cache, job.render_config)
                     renderer = None
-                    _release_worker_memory(renderer_cache)
-                    renderer = _renderer_for_config(renderer_cache, job.render_config, gpu_index)
+                    renderer_cache.reset_after_cuda_failure(job.render_config)
+                    renderer = renderer_cache.get(job.render_config)
                     continue
+                if is_cuda_failure(exc):
+                    renderer = None
+                    renderer_cache.reset_after_cuda_failure(job.render_config)
                 raise
         if cameras is None:
             if last_exc is not None:
@@ -1058,8 +992,8 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: dict[str, SceneRe
             "traceback": None,
         }
     except Exception as exc:
-        if _is_cuda_failure(exc):
-            _drop_renderer_for_config(renderer_cache, job.render_config)
+        if is_cuda_failure(exc):
+            renderer_cache.drop(job.render_config)
         finished_at = _utc_now()
         duration_ms = (time.perf_counter() - overall_start) * 1000.0
         error_type = type(exc).__name__
@@ -1107,15 +1041,17 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: dict[str, SceneRe
     finally:
         renderer = None
         assets = None
-        _release_worker_memory(renderer_cache)
+        renderer_cache.clear_texture_caches()
+        renderer_cache.release_cuda_memory()
 
 
 def _worker_main(worker_slot: int, gpu_index: int, job_queue: Any, result_queue: Any) -> None:
     torch.cuda.set_device(gpu_index)
-    renderer_cache: dict[str, SceneRenderer] = {}
+    renderer_cache = RendererCache(device=torch.device(f"cuda:{gpu_index}"))
     while True:
         job = job_queue.get()
         if job is None:
+            renderer_cache.close()
             return
         result_queue.put(_execute_job(job, gpu_index, renderer_cache, worker_slot))
 

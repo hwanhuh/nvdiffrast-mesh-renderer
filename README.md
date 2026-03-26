@@ -235,7 +235,7 @@ Large-scale preprocessing:
 ## Project Overview
 
 This is a CUDA + `nvdiffrast` based GLB/GLTF renderer. The current implementation is organized around a shared geometry pass plus a multi-mode render dispatcher, while preserving the earlier projected-winding front/back classification and premultiplied-alpha compositing fixes.
-The installable package is `nvdiffrast_mesh_renderer`, exposed via `nvdiffrast-mesh-render`, `nvdiffrast-mesh-render-all`, `nvdiffrast-mesh-render-multi-view`, `nvdiffrast-mesh-render-batch`, and `python -m nvdiffrast_mesh_renderer`. The repository-level `render_glb.py`, `render_all_modes.py`, and `render_multi_view.py` remain as thin wrappers around the package.
+The installable package is `nvdiffrast_mesh_renderer`, exposed via `nvdiffrast-mesh-render`, `nvdiffrast-mesh-render-all`, `nvdiffrast-mesh-render-multi-view`, `nvdiffrast-mesh-render-batch`, and `python -m nvdiffrast_mesh_renderer`.
 
 ## Current Features
 
@@ -300,11 +300,9 @@ When adding new batch features, keep caches job-scoped unless there is a deliber
 nvdiffrast_renderer/
 ├── scripts/
 │   └── install_nvdiffrast.sh       # Exact nvdiffrast source install helper
-├── render_glb.py                    # Main CLI entrypoint
-├── render_all_modes.py              # Convenience wrapper for --render-all
-├── render_multi_view.py             # Convenience wrapper for multi-view grids
 ├── nvdiffrast_mesh_renderer/
 │   ├── config.py                    # CLI parsing and RenderConfig
+│   ├── cli.py                       # Console entrypoints and multi-view orchestration
 │   ├── renderer.py                  # SceneRenderer and render-mode dispatch
 │   ├── scene_builder.py             # Mesh, camera, and light construction
 │   ├── geometry_pass.py             # Geometry pass, front/back split, wireframe topology
@@ -604,7 +602,4 @@ SceneRenderer(config).render_to_file()
 
 ## Reference Files
 
-- `render_glb.py`
-- `render_all_modes.py`
-- `render_multi_view.py`
 - `nvdiffrast_mesh_renderer/`

@@ -41,7 +41,9 @@ class RenderConfig:
     wireframe_thickness_px: float
     normalize_depth: bool
     render_all: bool
+    canonical_six_views: bool
     multi_view_chunk_size: int
+    benchmark_requested: bool
     benchmark_runs: int
     benchmark_warmup_runs: int
 
@@ -76,6 +78,32 @@ def _parse_range_triplet(args: argparse.Namespace, prefix: str) -> tuple[Optiona
     if step == 0.0:
         raise ValueError(f"--{prefix}-step must be non-zero")
     return start, end, step
+
+
+def _parse_benchmark_args(args: argparse.Namespace) -> tuple[bool, int, int]:
+    benchmark_runs_arg = getattr(args, "benchmark_runs", None)
+    benchmark_warmup_runs_arg = getattr(args, "benchmark_warmup_runs", None)
+    benchmark_requested = benchmark_runs_arg is not None or benchmark_warmup_runs_arg is not None
+    if not benchmark_requested:
+        return False, 0, 0
+    runs = 1 if benchmark_runs_arg is None else max(int(benchmark_runs_arg), 1)
+    warmup_runs = 0 if benchmark_warmup_runs_arg is None else max(int(benchmark_warmup_runs_arg), 0)
+    return True, runs, warmup_runs
+
+
+def _validate_multi_view_args(
+    args: argparse.Namespace,
+    elev_start: Optional[float],
+    elev_end: Optional[float],
+    elev_step: Optional[float],
+    azim_start: Optional[float],
+    azim_end: Optional[float],
+    azim_step: Optional[float],
+) -> None:
+    if bool(getattr(args, "canonical_six_views", False)) and any(
+        value is not None for value in (elev_start, elev_end, elev_step, azim_start, azim_end, azim_step)
+    ):
+        raise ValueError("--canonical-six-views cannot be combined with explicit multi-view range arguments")
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -132,9 +160,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--wireframe-thickness-px", type=float, default=1.0, help="Wireframe thickness in pixels")
     parser.add_argument("--normalize-depth", action="store_true", help="Normalize depth outputs across visible pixels for visualization")
     parser.add_argument("--render-all", action="store_true", help="Render every supported mode into a mode-named output directory")
+    parser.add_argument("--canonical-six-views", action="store_true", help="Render front, back, left, right, top, and bottom views in one multi-view run")
     parser.add_argument("--multi-view-chunk-size", type=int, default=4, help="Maximum number of multi-view jobs to run concurrently per chunk")
-    parser.add_argument("--benchmark-runs", type=int, default=1, help="Number of timed runs per mode during --render-all")
-    parser.add_argument("--benchmark-warmup-runs", type=int, default=0, help="Number of untimed warmup runs per mode during --render-all")
+    parser.add_argument("--benchmark-runs", type=int, default=None, help="Enable render-all benchmarking and set timed runs per mode")
+    parser.add_argument("--benchmark-warmup-runs", type=int, default=None, help="Enable render-all benchmarking and set untimed warmup runs per mode")
     parser.add_argument("--no-antialias", action="store_true", help="Disable edge antialiasing")
     parser.add_argument("--display", action="store_true", help="Display the result in an OpenGL window")
     return parser
@@ -144,6 +173,8 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
     background_rgba, background_transparent = parse_background(args.background)
     elev_start, elev_end, elev_step = _parse_range_triplet(args, "elev")
     azim_start, azim_end, azim_step = _parse_range_triplet(args, "azim")
+    _validate_multi_view_args(args, elev_start, elev_end, elev_step, azim_start, azim_end, azim_step)
+    benchmark_requested, benchmark_runs, benchmark_warmup_runs = _parse_benchmark_args(args)
     return RenderConfig(
         input=args.input,
         output=args.output,
@@ -179,7 +210,9 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         wireframe_thickness_px=max(float(getattr(args, "wireframe_thickness_px", 1.0)), 0.0),
         normalize_depth=bool(getattr(args, "normalize_depth", False)),
         render_all=bool(getattr(args, "render_all", False)),
+        canonical_six_views=bool(getattr(args, "canonical_six_views", False)),
         multi_view_chunk_size=max(int(getattr(args, "multi_view_chunk_size", 4)), 1),
-        benchmark_runs=max(int(getattr(args, "benchmark_runs", 1)), 1),
-        benchmark_warmup_runs=max(int(getattr(args, "benchmark_warmup_runs", 0)), 0),
+        benchmark_requested=benchmark_requested,
+        benchmark_runs=benchmark_runs,
+        benchmark_warmup_runs=benchmark_warmup_runs,
     )

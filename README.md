@@ -82,6 +82,8 @@ nvdiffrast-mesh-render example_meshes/c7fd79edb639400293683095caafff21_1024.glb 
 
 This writes one image per mode under `outputs/all_modes/`.
 
+By default, `render-all` just writes the per-mode images. Benchmark timing and `render_all_report.txt` are generated only when you explicitly pass `--benchmark-runs` and/or `--benchmark-warmup-runs`.
+
 Convenience wrapper for the same workflow:
 
 ```bash
@@ -96,7 +98,7 @@ Chunked multi-view render:
 
 ```bash
 nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff21_1024.glb \
-    --output outputs/multiview.png \
+    --output outputs/multiview \
     --resolution 1024 \
     --render-mode beauty \
     --azim-start 0 \
@@ -109,6 +111,18 @@ nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff2
 ```
 
 This writes one image per view under `outputs/multiview/` plus a `multiview_report.txt` manifest. If `--output` has an extension, the stem is used as the output directory. If it has no extension, that path is treated as the output directory directly.
+
+Canonical six-view render:
+
+```bash
+nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff21_1024.glb \
+    --output outputs/canonical_views \
+    --resolution 1024 \
+    --render-mode beauty \
+    --canonical-six-views
+```
+
+This writes `front`, `back`, `left`, `right`, `top`, and `bottom` view images into the output directory. In this mode the renderer first tries one chunk of 6 views, and if that hits CUDA OOM it retries automatically with chunk size 2.
 
 ## Render Modes
 
@@ -147,6 +161,7 @@ Input / output:
 - `--output`
 - `--resolution`
 - `--render-all`
+- `--canonical-six-views`
 - `--multi-view-chunk-size`
 
 Camera:
@@ -209,6 +224,7 @@ The installable package is `nvdiffrast_mesh_renderer`, exposed via `nvdiffrast-m
 - `beauty_plus_wireframe` overlay composition
 - Single render, render-all, and multi-view CLI flows
 - Chunked multi-view rendering across azimuth/elevation grids with per-chunk parallel execution
+- Canonical six-view rendering with `front/back/left/right/top/bottom` presets and `6 -> 2` CUDA OOM fallback
 
 ## Repository Layout
 
@@ -406,6 +422,16 @@ nvdiffrast-mesh-render example_meshes/c7fd79edb639400293683095caafff21_1024.glb 
 
 This is a smoke/inspection workflow, not a golden-image comparison.
 
+Benchmark-enabled render-all:
+
+```bash
+nvdiffrast-mesh-render-all example_meshes/c7fd79edb639400293683095caafff21_1024.glb \
+    --output outputs/mode_check \
+    --resolution 256 \
+    --benchmark-runs 5 \
+    --benchmark-warmup-runs 2
+```
+
 Multi-view inspection render:
 
 ```bash
@@ -417,6 +443,16 @@ nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff2
     --azim-end 180 \
     --azim-step 45 \
     --multi-view-chunk-size 4
+```
+
+Canonical six-view inspection render:
+
+```bash
+nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff21_1024.glb \
+    --output outputs/mode_grid_canonical \
+    --resolution 256 \
+    --render-mode beauty \
+    --canonical-six-views
 ```
 
 ## Programmatic Usage
@@ -468,6 +504,7 @@ SceneRenderer(config).render_to_file()
 - `--render-all` re-renders the scene once per mode, so it is intended as a validation/inspection workflow rather than the fastest batch path.
 - Multi-view rendering currently cannot be combined with `--render-all`.
 - `--display` is not meaningful for multi-view rendering because the view grid is emitted as files.
+- `--canonical-six-views` cannot be combined with explicit multi-view range flags such as `--azim-start` or `--elev-start`.
 - There is no support for animation, skinning, morph targets, or multi-camera scenes.
 - Hidden-line and multi-layer rendering are not implemented yet, though the raster path is structured so `nvdiffrast` DepthPeeler can be introduced later.
 

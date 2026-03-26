@@ -40,6 +40,12 @@ def perspective(fov_y_deg: float, aspect: float, near: float, far: float) -> np.
 
 def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     forward = safe_normalize_np(target - eye)
+    up = safe_normalize_np(up.astype(np.float32))
+    if abs(float(np.dot(forward, up))) > 0.999:
+        fallback_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        if abs(float(np.dot(forward, fallback_up))) > 0.999:
+            fallback_up = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        up = fallback_up
     right = safe_normalize_np(np.cross(forward, up))
     true_up = safe_normalize_np(np.cross(right, forward))
     view = np.eye(4, dtype=np.float32)

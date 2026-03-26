@@ -31,19 +31,34 @@ class LayerCompositor:
         return out_rgb.unsqueeze(0), out_alpha.unsqueeze(0)
 
     def merge_double_sided(self, front: RenderImage, back: RenderImage, alpha_mode: str) -> RenderImage:
+        use_front, use_back, visible = self._select_nearest_visible_side(front, back)
         if alpha_mode == "BLEND":
             rgb, alpha = self.composite_mesh_layers(torch.zeros_like(front.rgb), torch.zeros_like(front.alpha), [front, back])
             valid = alpha > 1e-5
-            front_closer = front.valid & (~back.valid | (front.depth >= back.depth))
-            depth = torch.where(front_closer, front.depth, back.depth)
+            depth = torch.where(use_front, front.depth, torch.where(use_back, back.depth, torch.zeros_like(front.depth)))
             return RenderImage(rgb=rgb, alpha=alpha, depth=torch.where(valid, depth, torch.zeros_like(depth)), valid=valid)
-        front_cover = front.alpha > 1e-5
         return RenderImage(
-            rgb=torch.where(front_cover.expand_as(front.rgb), front.rgb, back.rgb),
-            alpha=torch.where(front_cover, front.alpha, back.alpha),
-            depth=torch.where(front_cover, front.depth, back.depth),
-            valid=front.valid | back.valid,
+            rgb=torch.where(
+                use_front.expand_as(front.rgb),
+                front.rgb,
+                torch.where(use_back.expand_as(back.rgb), back.rgb, torch.zeros_like(front.rgb)),
+            ),
+            alpha=torch.where(use_front, front.alpha, torch.where(use_back, back.alpha, torch.zeros_like(front.alpha))),
+            depth=torch.where(use_front, front.depth, torch.where(use_back, back.depth, torch.zeros_like(front.depth))),
+            valid=visible,
         )
+
+    def _select_nearest_visible_side(
+        self,
+        front: RenderImage,
+        back: RenderImage,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        front_visible = front.valid & (front.alpha > 1e-5)
+        back_visible = back.valid & (back.alpha > 1e-5)
+        # Depth stores positive camera distance, so smaller values are nearer.
+        use_front = front_visible & (~back_visible | (front.depth <= back.depth))
+        use_back = back_visible & ~use_front
+        return use_front, use_back, front_visible | back_visible
 
     def compose_overlays(
         self,

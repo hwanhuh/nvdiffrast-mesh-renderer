@@ -54,14 +54,24 @@ class RenderModeRegistry:
 
 
 class SceneRenderer:
-    def __init__(self, config: RenderConfig, device: torch.device | None = None):
+    def __init__(
+        self,
+        config: RenderConfig,
+        device: torch.device | None = None,
+        environment_service: EnvironmentService | None = None,
+    ):
         self.config = config
-        self.device = torch.device("cuda") if device is None else device
+        self.device = torch.device("cuda") if device is None else torch.device(device)
         self.glctx = dr.RasterizeCudaContext(device=self.device)
+        # Mesh/material textures are renderer-local so batch jobs can clear them aggressively between meshes.
         self.cache = TextureCache(self.device)
         self.scene_builder = SceneBuilder(self.cache, self.device)
         self.scene_builder.configure_geometry_preprocess(config)
-        self.environment = EnvironmentService(self.cache)
+        self.environment = (
+            EnvironmentService(TextureCache(self.device, max_file_entries=4))
+            if environment_service is None
+            else environment_service
+        )
         self.geometry = GeometryPassRenderer(self.glctx, config)
         self.compositor = LayerCompositor()
         self.postprocessor = ImagePostprocessor(config)

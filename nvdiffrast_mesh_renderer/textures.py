@@ -1,7 +1,8 @@
+from collections import OrderedDict
 import pathlib
 import subprocess
 import weakref
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import imageio.v3 as iio
@@ -53,10 +54,24 @@ def mip_level_count(height: int, width: int) -> int:
     return levels
 
 
+def make_gpu_texture(array: np.ndarray, device: torch.device, srgb: bool) -> GpuTexture:
+    array = np.flip(array[..., None] if array.ndim == 2 else array, axis=0).copy()
+    tensor = torch.from_numpy(array).to(device, dtype=torch.float32)
+    if srgb and tensor.shape[-1] >= 3:
+        rgb = srgb_to_linear(tensor[..., :3])
+        tensor = torch.cat([rgb, tensor[..., 3:]], dim=-1) if tensor.shape[-1] > 3 else rgb
+    tensor = tensor.unsqueeze(0).contiguous()
+    max_mip_level = mip_level_count(tensor.shape[1], tensor.shape[2])
+    mip = dr.texture_construct_mip(tensor, max_mip_level=max_mip_level) if max_mip_level > 0 else None
+    return GpuTexture(tex=tensor, mip=mip, can_mip=max_mip_level > 0, max_mip_level=max_mip_level or None)
+
+
 class TextureCache:
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, *, max_file_entries: int = 0):
         self.device = device
         self._cache: dict[tuple[str, int, bool, object], tuple[weakref.ReferenceType[object], GpuTexture]] = {}
+        self._max_file_entries = max(int(max_file_entries), 0)
+        self._file_cache: OrderedDict[tuple[str, str, bool, object, tuple[int, int, int, int]], GpuTexture] = OrderedDict()
 
     def _cache_key(self, kind: str, source: object, srgb: bool, variant: object) -> tuple[str, int, bool, object]:
         return (kind, id(source), srgb, variant)
@@ -79,15 +94,16 @@ class TextureCache:
         return texture
 
     def _make_texture(self, array: np.ndarray, srgb: bool) -> GpuTexture:
-        array = np.flip(array[..., None] if array.ndim == 2 else array, axis=0).copy()
-        tensor = torch.from_numpy(array).to(self.device, dtype=torch.float32)
-        if srgb and tensor.shape[-1] >= 3:
-            rgb = srgb_to_linear(tensor[..., :3])
-            tensor = torch.cat([rgb, tensor[..., 3:]], dim=-1) if tensor.shape[-1] > 3 else rgb
-        tensor = tensor.unsqueeze(0).contiguous()
-        max_mip_level = mip_level_count(tensor.shape[1], tensor.shape[2])
-        mip = dr.texture_construct_mip(tensor, max_mip_level=max_mip_level) if max_mip_level > 0 else None
-        return GpuTexture(tex=tensor, mip=mip, can_mip=max_mip_level > 0, max_mip_level=max_mip_level or None)
+        return make_gpu_texture(array, self.device, srgb=srgb)
+
+    def _file_signature(self, path: pathlib.Path) -> tuple[pathlib.Path, tuple[int, int, int, int]]:
+        resolved = path.expanduser().resolve()
+        stat = resolved.stat()
+        return resolved, (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+
+    def _trim_file_cache(self) -> None:
+        while self._max_file_entries > 0 and len(self._file_cache) > self._max_file_entries:
+            self._file_cache.popitem(last=False)
 
     def get_pil(self, image: Optional[Image.Image], srgb: bool, mode: str) -> Optional[GpuTexture]:
         if image is None:
@@ -105,8 +121,33 @@ class TextureCache:
             return cached
         return self._store_cached(key, array, self._make_texture(array, srgb=srgb))
 
+    def get_file(
+        self,
+        path: pathlib.Path,
+        srgb: bool = False,
+        *,
+        variant: object = None,
+        loader: Callable[[pathlib.Path], np.ndarray] | None = None,
+    ) -> GpuTexture:
+        resolved, signature = self._file_signature(path)
+        if self._max_file_entries <= 0:
+            array = load_image_file(resolved) if loader is None else loader(resolved)
+            return self._make_texture(array, srgb=srgb)
+        key = ("file", str(resolved), srgb, variant, signature)
+        cached = self._file_cache.get(key)
+        if cached is not None:
+            self._file_cache.move_to_end(key)
+            return cached
+        array = load_image_file(resolved) if loader is None else loader(resolved)
+        texture = self._make_texture(array, srgb=srgb)
+        self._file_cache[key] = texture
+        self._file_cache.move_to_end(key)
+        self._trim_file_cache()
+        return texture
+
     def clear(self) -> None:
         self._cache.clear()
+        self._file_cache.clear()
 
 
 def sample_texture(

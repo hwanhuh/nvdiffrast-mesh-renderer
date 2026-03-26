@@ -45,7 +45,7 @@ python -m nvdiffrast_mesh_renderer --help
 - `nvdiffrast-mesh-render`: single render. One renderer/context is created for the invocation, used for one render, then discarded on exit or CUDA failure.
 - `nvdiffrast-mesh-render-all`: sequential multi-render. One renderer/context is reused across all render modes for the invocation.
 - `nvdiffrast-mesh-render-multi-view`: sequential multi-render. One renderer/context is reused across the whole multi-view run, with chunk-based view preparation and renderer recreation before retry after CUDA OOM.
-- `nvdiffrast-mesh-render-batch`: multi-process multi-GPU scheduling. One worker process runs per GPU, and each worker renders sequentially through one renderer/context at a time while clearing texture caches between jobs.
+- `nvdiffrast-mesh-render-batch`: multi-process multi-GPU scheduling. One worker process runs per GPU, each worker keeps only one active renderer/context at a time, and mesh/material texture caches are cleared between jobs.
 
 ## Usage
 
@@ -142,7 +142,7 @@ nvdiffrast-mesh-render-batch \
     --view-chunk-sizes 24,8,4,2,1
 ```
 
-Batch mode runs one long-lived worker process per GPU. Each worker reuses one `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context for sequential rendering, clears texture caches between jobs, and recreates the renderer/context before retrying after CUDA OOM or other CUDA failures.
+Batch mode runs one long-lived worker process per GPU. Each worker reuses one active `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context for sequential rendering, clears mesh/material texture caches between jobs, keeps environment-map/background helpers in separate bounded worker-local caches, and recreates the renderer/context before retrying after CUDA OOM or other CUDA failures.
 
 Double-sided meshes default to bounded depth peeling with up to 4 layers per winding bucket. Reduce or disable it with `--double-sided-depth-peels 1` if you need the older single-layer front/back behavior.
 
@@ -255,8 +255,8 @@ The installable package is `nvdiffrast_mesh_renderer`, exposed via `nvdiffrast-m
 - Manifest-driven batch rendering with one worker process per GPU
 - Long-lived batch workers that reuse one `SceneRenderer` / CUDA rasterizer context per GPU
 - Per-job texture-cache cleanup and renderer recreation on CUDA OOM before retry
-- Chunked multi-view rendering across azimuth/elevation grids with per-chunk parallel execution
-- Canonical six-view rendering with `front/back/left/right/top/bottom` presets and `6 -> 2` CUDA OOM fallback
+- Chunked multi-view rendering across azimuth/elevation grids with sequential per-chunk rendering
+- Canonical six-view rendering with `front/back/left/right/top/bottom` presets and `6 -> 2 -> 1` CUDA OOM fallback
 - Faster scene loading by iterating scene graph instances directly instead of `scene.dump(concatenate=False)`
 - Automatic CUDA geometry preprocessing for large meshes to speed up face-normal and tangent generation
 
@@ -265,9 +265,10 @@ The installable package is `nvdiffrast_mesh_renderer`, exposed via `nvdiffrast-m
 Batch rendering is intentionally conservative about CUDA context ownership:
 
 - one worker process owns one GPU
-- one worker reuses one `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context across many jobs
+- one worker keeps one active `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context across many jobs
 - rendering inside a worker is sequential, not multithreaded, so one CUDA rasterizer context is never shared across concurrent threads
 - worker-local texture caches are cleared between jobs so mesh/material textures do not accumulate indefinitely across a long batch run
+- environment maps use a separate bounded worker-local GPU cache, keyed by file metadata instead of Python object identity
 - if a render attempt hits CUDA OOM, the worker drops the current renderer/context, releases cache state, and recreates the renderer before retrying with the next smaller chunk size
 
 This is the operating model to preserve when extending the batch path.
@@ -285,10 +286,11 @@ This is the operating model to preserve when extending the batch path.
 In practice, application-level caches are a more likely source of long-running memory growth than `nvdiffrast` itself. The main risk areas are:
 
 - texture caches that retain per-job GPU textures after the job has finished
+- environment-map GPU textures that should stay separate from mesh/material caches and use explicit eviction
 - persistent references to prepared scenes, meshes, mip stacks, or antialias topology hashes
 - retry paths that keep using a renderer/context after CUDA OOM instead of rebuilding it
 
-When adding new batch features, keep caches job-scoped unless there is a deliberate eviction strategy, and prefer recreating worker-local renderer state after CUDA failures.
+When adding new batch features, keep caches job-scoped unless there is a deliberate eviction strategy, prefer recreating worker-local renderer state after CUDA failures, and avoid config-keyed renderer pools that let multiple rasterizer contexts accumulate inside one worker.
 
 ## Repository Layout
 

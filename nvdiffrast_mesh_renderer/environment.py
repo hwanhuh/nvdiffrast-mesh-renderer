@@ -10,6 +10,12 @@ from .textures import TextureCache, direction_to_latlong_uv, load_image_file, sa
 from .types import CameraData, EnvironmentData
 
 
+def _load_environment_array(path: pathlib.Path):
+    env_array = load_image_file(path)
+    env_array = env_array[..., :3] if env_array.shape[-1] > 3 else env_array
+    return env_array.astype("float32", copy=False)
+
+
 def sample_environment(
     env: EnvironmentData,
     direction: torch.Tensor,
@@ -22,17 +28,42 @@ def sample_environment(
     return sampled[..., :3] * float(env.light_intensity if intensity is None else intensity)
 
 
+class BackgroundRayGridCache:
+    def __init__(self):
+        self._coords: dict[tuple[str, int | None, int], torch.Tensor] = {}
+
+    def get_coords(self, resolution: int, device: torch.device) -> torch.Tensor:
+        # Reuse the screen-space coordinate vector; per-view ray directions still depend on FOV and camera rotation.
+        key = (device.type, device.index, int(resolution))
+        coords = self._coords.get(key)
+        if coords is None:
+            coords = torch.linspace(-1.0 + 1.0 / resolution, 1.0 - 1.0 / resolution, resolution, device=device, dtype=torch.float32)
+            self._coords[key] = coords
+        return coords
+
+    def clear(self) -> None:
+        self._coords.clear()
+
+
 class EnvironmentService:
-    def __init__(self, cache: TextureCache):
+    def __init__(self, cache: TextureCache, *, background_grid_cache: BackgroundRayGridCache | None = None):
         self.cache = cache
+        self.background_grid_cache = BackgroundRayGridCache() if background_grid_cache is None else background_grid_cache
+
+    def clear_persistent_caches(self) -> None:
+        self.cache.clear()
+        self.background_grid_cache.clear()
 
     def build(self, config: RenderConfig) -> Optional[EnvironmentData]:
         if not config.env_map:
             return None
-        env_array = load_image_file(pathlib.Path(config.env_map))
-        env_array = env_array[..., :3] if env_array.shape[-1] > 3 else env_array
         return EnvironmentData(
-            texture=self.cache.get_array(env_array.astype("float32"), srgb=False),
+            texture=self.cache.get_file(
+                pathlib.Path(config.env_map),
+                srgb=False,
+                variant="env_rgb",
+                loader=_load_environment_array,
+            ),
             light_intensity=config.env_light_intensity,
             background_intensity=config.env_background_intensity,
         )
@@ -46,10 +77,20 @@ class EnvironmentService:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         res = config.resolution
         if env is not None and config.env_usage in {"background", "both"}:
-            coords = torch.linspace(-1.0 + 1.0 / res, 1.0 - 1.0 / res, res, device=device, dtype=torch.float32)
-            yv, xv = torch.meshgrid(coords, coords, indexing="ij")
+            coords = self.background_grid_cache.get_coords(res, device)
+            yv = coords.view(res, 1).expand(res, res)
+            xv = coords.view(1, res).expand(res, res)
             tan_half = math.tan(math.radians(config.fov) * 0.5)
-            dirs_cam = safe_normalize(torch.stack([xv * tan_half, yv * tan_half, -torch.ones_like(xv)], dim=-1))
+            dirs_cam = safe_normalize(
+                torch.stack(
+                    [
+                        xv * tan_half,
+                        yv * tan_half,
+                        torch.full((res, res), -1.0, device=device, dtype=torch.float32),
+                    ],
+                    dim=-1,
+                )
+            )
             dirs_world = torch.matmul(dirs_cam, camera.cam_to_world[:3, :3].t()).unsqueeze(0)
             bg = sample_environment(env, dirs_world, intensity=env.background_intensity)
             return bg, torch.ones_like(bg[..., :1])

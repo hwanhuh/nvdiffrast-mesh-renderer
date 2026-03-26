@@ -7,7 +7,9 @@ import numpy as np
 import torch
 
 from .config import RenderConfig
+from .environment import EnvironmentService
 from .renderer import SceneRenderer
+from .textures import TextureCache
 
 _CACHE_KEY_EXCLUDED_FIELDS = frozenset(
     {
@@ -82,30 +84,42 @@ def renderer_cache_key(config: RenderConfig) -> str:
 
 class RendererCache:
     def __init__(self, *, device: torch.device | None = None):
-        self.device = device
-        self._renderers: dict[str, SceneRenderer] = {}
+        self.device = torch.device("cuda") if device is None else torch.device(device)
+        # Env maps and background helpers are process/GPU-scoped, while mesh textures stay renderer/job-scoped.
+        self._environment_service = EnvironmentService(TextureCache(self.device, max_file_entries=4))
+        self._active_key: str | None = None
+        self._active_renderer: SceneRenderer | None = None
 
-    def get(self, config: RenderConfig) -> SceneRenderer:
-        key = renderer_cache_key(config)
-        renderer = self._renderers.get(key)
-        if renderer is None:
-            renderer = SceneRenderer(config, device=self.device)
-            self._renderers[key] = renderer
-        return renderer
-
-    def clear_texture_caches(self) -> None:
-        for renderer in self._renderers.values():
-            renderer.clear_texture_cache()
-
-    def drop(self, config: RenderConfig) -> None:
-        renderer = self._renderers.pop(renderer_cache_key(config), None)
+    def _discard_active_renderer(self) -> None:
+        renderer = self._active_renderer
+        self._active_renderer = None
+        self._active_key = None
         if renderer is not None:
             renderer.clear_texture_cache()
 
+    def get(self, config: RenderConfig) -> SceneRenderer:
+        key = renderer_cache_key(config)
+        if self._active_renderer is not None and self._active_key == key:
+            return self._active_renderer
+        self._discard_active_renderer()
+        renderer = SceneRenderer(config, device=self.device, environment_service=self._environment_service)
+        self._active_renderer = renderer
+        self._active_key = key
+        return renderer
+
+    def clear_texture_caches(self) -> None:
+        if self._active_renderer is not None:
+            self._active_renderer.clear_texture_cache()
+
+    def drop(self, config: RenderConfig) -> None:
+        if self._active_key == renderer_cache_key(config):
+            self._discard_active_renderer()
+
     def drop_all(self) -> None:
-        for renderer in self._renderers.values():
-            renderer.clear_texture_cache()
-        self._renderers.clear()
+        self._discard_active_renderer()
+
+    def clear_process_caches(self) -> None:
+        self._environment_service.clear_persistent_caches()
 
     def release_cuda_memory(self) -> None:
         gc.collect()
@@ -113,13 +127,13 @@ class RendererCache:
             torch.cuda.empty_cache()
 
     def reset_after_cuda_failure(self, config: RenderConfig | None = None) -> None:
-        if config is None:
-            self.drop_all()
-        else:
-            self.drop(config)
-        self.clear_texture_caches()
+        del config
+        # One execution lane keeps at most one live renderer/context, so any CUDA failure taints the active one.
+        self.drop_all()
+        self.clear_process_caches()
         self.release_cuda_memory()
 
     def close(self) -> None:
         self.drop_all()
+        self.clear_process_caches()
         self.release_cuda_memory()

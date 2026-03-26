@@ -19,6 +19,7 @@ from PIL import Image
 
 from .config import RenderConfig, add_render_arguments, config_from_args, config_with_overrides
 from .lifecycle import RendererCache, is_cuda_failure, is_cuda_oom
+from .logging_utils import RunLogger, estimate_remaining_ms, format_duration_ms, format_path_notice
 from .renderer import SceneRenderer
 
 CANONICAL_SIX_VIEW_SPECS = (
@@ -584,6 +585,10 @@ def _validate_output_root(output_root: pathlib.Path) -> None:
     probe_path.unlink()
 
 
+def _batch_log_path(output_root: pathlib.Path) -> pathlib.Path:
+    return output_root / "batch.log"
+
+
 def _init_status_db(path: pathlib.Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
@@ -887,7 +892,7 @@ def _write_failed_job_report_if_needed(
     _write_json(temp_output_dir / "job_report.json", report)
 
 
-def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, worker_slot: int) -> dict[str, Any]:
+def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, worker_slot: int, logger: RunLogger) -> dict[str, Any]:
     torch.cuda.set_device(gpu_index)
     worker_id = f"worker-{worker_slot}-gpu{gpu_index}"
     output_dir = pathlib.Path(job.output_dir)
@@ -904,6 +909,7 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
     renderer: SceneRenderer | None = None
     assets: Any | None = None
     try:
+        logger.log(f"Started job {job.mesh_id} with {len(job.views)} view(s) -> {job.output_dir}")
         if temp_output_dir.exists():
             _remove_path(temp_output_dir)
         if output_dir.exists() and job.overwrite in {"all", "failed"}:
@@ -933,6 +939,11 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
                 last_exc = exc
                 if is_cuda_oom(exc) and chunk_size != job.view_chunk_sizes[-1]:
                     oom_retries += 1
+                    next_chunk_size = job.view_chunk_sizes[job.view_chunk_sizes.index(chunk_size) + 1]
+                    logger.log(
+                        f"Job {job.mesh_id} hit CUDA OOM at chunk size {chunk_size}; "
+                        f"recreating renderer and retrying with chunk size {next_chunk_size}."
+                    )
                     renderer = None
                     renderer_cache.reset_after_cuda_failure(job.render_config)
                     renderer = renderer_cache.get(job.render_config)
@@ -968,6 +979,10 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
             ),
         )
         temp_output_dir.rename(output_dir)
+        logger.log(
+            f"Completed job {job.mesh_id}: {len(job.views)} view(s), "
+            f"chunk_size={view_chunk_size_used}, oom_retries={oom_retries}, output={job.output_dir}"
+        )
         return {
             "worker_slot": worker_slot,
             "worker_id": worker_id,
@@ -992,6 +1007,7 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
             "traceback": None,
         }
     except Exception as exc:
+        logger.log(f"Failed job {job.mesh_id}: {type(exc).__name__}: {exc}")
         if is_cuda_failure(exc):
             renderer_cache.drop(job.render_config)
         finished_at = _utc_now()
@@ -1045,30 +1061,31 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
         renderer_cache.release_cuda_memory()
 
 
-def _worker_main(worker_slot: int, gpu_index: int, job_queue: Any, result_queue: Any) -> None:
+def _worker_main(worker_slot: int, gpu_index: int, job_queue: Any, result_queue: Any, log_path: str, echo: bool) -> None:
     torch.cuda.set_device(gpu_index)
     # Batch mode isolates concurrency at the process level; each worker uses one renderer/context sequentially.
-    renderer_cache = RendererCache(device=torch.device(f"cuda:{gpu_index}"))
+    logger = RunLogger(pathlib.Path(log_path), echo=echo, prefix=f"worker-{worker_slot}-gpu{gpu_index}")
+    renderer_cache = RendererCache(device=torch.device(f"cuda:{gpu_index}"), logger=logger)
     while True:
         job = job_queue.get()
         if job is None:
             renderer_cache.close()
             return
-        result_queue.put(_execute_job(job, gpu_index, renderer_cache, worker_slot))
+        result_queue.put(_execute_job(job, gpu_index, renderer_cache, worker_slot, logger))
 
 
-def _start_worker(ctx: mp.context.BaseContext, slot: int, gpu_index: int, result_queue: Any) -> WorkerState:
+def _start_worker(ctx: mp.context.BaseContext, slot: int, gpu_index: int, result_queue: Any, log_path: str, echo: bool) -> WorkerState:
     job_queue = ctx.Queue()
-    process = ctx.Process(target=_worker_main, args=(slot, gpu_index, job_queue, result_queue), daemon=True)
+    process = ctx.Process(target=_worker_main, args=(slot, gpu_index, job_queue, result_queue, log_path, echo), daemon=True)
     process.start()
     return WorkerState(slot=slot, gpu_index=gpu_index, job_queue=job_queue, process=process)
 
 
-def _restart_worker(ctx: mp.context.BaseContext, worker: WorkerState, result_queue: Any) -> WorkerState:
+def _restart_worker(ctx: mp.context.BaseContext, worker: WorkerState, result_queue: Any, log_path: str, echo: bool) -> WorkerState:
     if worker.process.is_alive():
         worker.process.terminate()
     worker.process.join(timeout=5)
-    return _start_worker(ctx, worker.slot, worker.gpu_index, result_queue)
+    return _start_worker(ctx, worker.slot, worker.gpu_index, result_queue, log_path, echo)
 
 
 def _stop_worker(worker: WorkerState) -> None:
@@ -1238,6 +1255,8 @@ def main() -> None:
         raise ValueError(f"Manifest does not exist: {manifest_path}")
     output_root = pathlib.Path(args.output_root).expanduser().resolve()
     _validate_output_root(output_root)
+    batch_logger = RunLogger(_batch_log_path(output_root), echo=bool(args.print_progress), prefix="batch")
+    batch_logger.reset()
 
     base_config = config_from_args(args)
     global_view_source = _build_global_view_source(args)
@@ -1262,6 +1281,10 @@ def main() -> None:
         selected_rows=len(selected_entries),
         gpu_list=gpu_list,
     )
+    batch_logger.log(
+        f"Started batch run: manifest={manifest_path}, output_root={output_root}, "
+        f"selected_rows={len(selected_entries)}, gpus={gpu_list}"
+    )
 
     success_count = 0
     failed_count = 0
@@ -1269,6 +1292,31 @@ def main() -> None:
     success_metrics: list[dict[str, Any]] = []
     jobs_to_run: list[JobSpec] = []
     abort_requested = False
+    total_selected = len(selected_entries)
+    processed_count = 0
+
+    def _progress(status: str, detail: str, *, last_ms: float | None = None) -> None:
+        elapsed_ms = (time.perf_counter() - batch_start_perf) * 1000.0
+        eta_ms = estimate_remaining_ms(processed_count, total_selected, elapsed_ms)
+        batch_logger.log(
+            f"Progress {processed_count}/{total_selected}: {status} {detail}",
+            console="always",
+            console_message=(
+                f"[Progress] [{processed_count}/{total_selected}] {status}: {detail} "
+                f"(last: {format_duration_ms(last_ms)} / ETA: {format_duration_ms(eta_ms)})"
+            ),
+        )
+
+    batch_logger.log(
+        f"Batch progress initialized for {total_selected} selected row(s).",
+        console="always",
+        console_message="[Info] Initializing",
+    )
+    batch_logger.log(
+        f"Batch total meshes: {total_selected}, workers: {len(gpu_list)}",
+        console="always",
+        console_message=f"[Info] Batch Items: total={total_selected}, workers={len(gpu_list)}",
+    )
 
     for entry in selected_entries:
         if entry.error_message is not None:
@@ -1289,8 +1337,12 @@ def main() -> None:
                     gpu_index=None,
                     increment_attempt=False,
                 )
+            processed_count += 1
+            mesh_label = entry.mesh_id or f"row-{entry.row_index + 1}"
+            _progress("failed", f"{mesh_label} validation")
             if args.fail_fast or (args.max_failures is not None and failed_count >= args.max_failures):
                 abort_requested = True
+                batch_logger.log("Aborting during candidate validation due to fail-fast/max-failures policy.")
                 break
             continue
         assert entry.mesh_id is not None
@@ -1338,6 +1390,9 @@ def main() -> None:
                     increment_attempt=False,
                 )
                 _record_event(events_path, "job_skipped", mesh_id=job.mesh_id, row_index=job.row_index, output_dir=job.output_dir, reason=skip_reason)
+                batch_logger.log(f"Skipped job {job.mesh_id}: {skip_reason}")
+                processed_count += 1
+                _progress("skipped", job.mesh_id)
                 continue
             jobs_to_run.append(job)
         except Exception as exc:
@@ -1359,15 +1414,21 @@ def main() -> None:
                 increment_attempt=False,
             )
             _record_event(events_path, "job_failed", mesh_id=entry.mesh_id, row_index=entry.row_index, error_type=type(exc).__name__, error_message=error_message)
+            processed_count += 1
+            _progress("failed", f"{entry.mesh_id} normalization")
             if args.fail_fast or (args.max_failures is not None and failed_count >= args.max_failures):
                 abort_requested = True
+                batch_logger.log("Aborting during job normalization due to fail-fast/max-failures policy.")
                 break
 
     if not abort_requested and jobs_to_run:
         ctx = mp.get_context("spawn")
         result_queue = ctx.Queue()
-        workers = [_start_worker(ctx, slot, gpu_index, result_queue) for slot, gpu_index in enumerate(gpu_list)]
+        log_path = str(_batch_log_path(output_root))
+        echo = bool(args.print_progress)
+        workers = [_start_worker(ctx, slot, gpu_index, result_queue, log_path, echo) for slot, gpu_index in enumerate(gpu_list)]
         pending_jobs = list(jobs_to_run)
+        batch_logger.log(f"Dispatching {len(pending_jobs)} job(s) across {len(workers)} worker(s).")
         try:
             while pending_jobs or any(worker.current_job is not None for worker in workers):
                 if not abort_requested:
@@ -1375,7 +1436,7 @@ def main() -> None:
                         if worker.current_job is not None or not pending_jobs:
                             continue
                         if not worker.process.is_alive():
-                            workers[index] = worker = _restart_worker(ctx, worker, result_queue)
+                            workers[index] = worker = _restart_worker(ctx, worker, result_queue, log_path, echo)
                         job = pending_jobs.pop(0)
                         started_at = _utc_now()
                         _upsert_status(
@@ -1411,14 +1472,26 @@ def main() -> None:
                     if result["status"] == "success":
                         success_count += 1
                         success_metrics.append(result)
+                        batch_logger.log(
+                            f"Job succeeded: mesh_id={result['mesh_id']}, gpu={result['gpu_index']}, "
+                            f"duration_ms={_round(result['duration_ms'])}, output={result['output_dir']}"
+                        )
+                        processed_count += 1
+                        _progress("success", result["mesh_id"], last_ms=float(result["duration_ms"]))
                     else:
                         failed_count += 1
+                        batch_logger.log(
+                            f"Job failed: mesh_id={result['mesh_id']}, gpu={result['gpu_index']}, "
+                            f"error={result['error_type']}: {result['error_message']}"
+                        )
+                        processed_count += 1
+                        _progress("failed", result["mesh_id"], last_ms=float(result["duration_ms"]))
                     if result["status"] == "failed" and (args.fail_fast or (args.max_failures is not None and failed_count >= args.max_failures)):
                         abort_requested = True
                 for index, worker in enumerate(workers):
                     if worker.current_job is None:
                         if not worker.process.is_alive():
-                            workers[index] = _restart_worker(ctx, worker, result_queue)
+                            workers[index] = _restart_worker(ctx, worker, result_queue, log_path, echo)
                         continue
                     if not worker.process.is_alive():
                         duration_ms = 0.0
@@ -1427,7 +1500,10 @@ def main() -> None:
                         result = _external_failure_result(worker.current_job, worker, error_type="WorkerExitError", error_message="worker exited unexpectedly", duration_ms=duration_ms)
                         _finalize_job_result(conn, events_path, result)
                         failed_count += 1
-                        workers[index] = _restart_worker(ctx, worker, result_queue)
+                        batch_logger.log(f"Worker exited unexpectedly for mesh_id={result['mesh_id']}; restarting worker.")
+                        processed_count += 1
+                        _progress("failed", f"{result['mesh_id']} worker-exit", last_ms=float(result["duration_ms"]))
+                        workers[index] = _restart_worker(ctx, worker, result_queue, log_path, echo)
                         if args.fail_fast or (args.max_failures is not None and failed_count >= args.max_failures):
                             abort_requested = True
                             break
@@ -1446,11 +1522,15 @@ def main() -> None:
                             worker.process.join(timeout=5)
                             _finalize_job_result(conn, events_path, result)
                             failed_count += 1
-                            workers[index] = _start_worker(ctx, worker.slot, worker.gpu_index, result_queue)
+                            batch_logger.log(f"Timed out mesh_id={result['mesh_id']} after {args.mesh_timeout_sec} sec; restarting worker.")
+                            processed_count += 1
+                            _progress("failed", f"{result['mesh_id']} timeout", last_ms=float(result["duration_ms"]))
+                            workers[index] = _start_worker(ctx, worker.slot, worker.gpu_index, result_queue, log_path, echo)
                             if args.fail_fast or (args.max_failures is not None and failed_count >= args.max_failures):
                                 abort_requested = True
                                 break
                 if abort_requested:
+                    batch_logger.log("Batch abort requested; terminating in-flight workers.")
                     for worker in workers:
                         if worker.current_job is not None:
                             elapsed_ms = 0.0 if worker.current_started_mono is None else (time.monotonic() - worker.current_started_mono) * 1000.0
@@ -1465,6 +1545,8 @@ def main() -> None:
                             )
                             _finalize_job_result(conn, events_path, result)
                             failed_count += 1
+                            processed_count += 1
+                            _progress("failed", f"{result['mesh_id']} aborted", last_ms=float(result["duration_ms"]))
                         _stop_worker(worker)
                     break
         finally:
@@ -1505,6 +1587,15 @@ def main() -> None:
         success_count=success_count,
         failed_count=failed_count,
         skipped_count=skipped_count,
+    )
+    batch_logger.log(
+        f"Finished batch run: success={success_count}, failed={failed_count}, skipped={skipped_count}, "
+        f"duration_sec={_round(duration_sec)}, summary={summary_path}"
+    )
+    batch_logger.log(
+        f"Batch progress completed: {processed_count}/{total_selected}",
+        console="always",
+        console_message=format_path_notice("Info", "Done. Log file:", batch_logger.path),
     )
     conn.close()
 

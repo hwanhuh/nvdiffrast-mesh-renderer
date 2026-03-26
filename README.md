@@ -47,6 +47,8 @@ python -m nvdiffrast_mesh_renderer --help
 - `nvdiffrast-mesh-render-multi-view`: sequential multi-render. One renderer/context is reused across the whole multi-view run, with chunk-based view preparation and renderer recreation before retry after CUDA OOM.
 - `nvdiffrast-mesh-render-batch`: multi-process multi-GPU scheduling. One worker process runs per GPU, each worker keeps only one active renderer/context at a time, and mesh/material texture caches are cleared between jobs.
 
+CLI entrypoints print concise `Info/Progress/Done` status lines to stdout by default, including totals and ETA where applicable. Each run also writes a `.log` file next to its outputs, and `--print` enables raw stdout echo of the full progress/report text.
+
 ## Usage
 
 Basic beauty render:
@@ -88,9 +90,7 @@ nvdiffrast-mesh-render example_meshes/c7fd79edb639400293683095caafff21_1024.glb 
     --render-all
 ```
 
-This writes one image per mode under `outputs/all_modes/`.
-
-By default, `render-all` just writes the per-mode images. Benchmark timing and `render_all_report.txt` are generated only when you explicitly pass `--benchmark-runs` and/or `--benchmark-warmup-runs`.
+This writes one image per mode under `outputs/all_modes/`, plus `render_all_report.txt` and `render_all.log`. If you pass `--benchmark-runs` and/or `--benchmark-warmup-runs`, the same report file also includes timing rows.
 
 Convenience wrapper for the same workflow:
 
@@ -118,7 +118,7 @@ nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff2
     --multi-view-chunk-size 4
 ```
 
-This writes one image per view under `outputs/multiview/` plus a `multiview_report.txt` manifest. The multi-view CLI reuses one `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context sequentially for the whole run, stages up to `--multi-view-chunk-size` views per chunk, and recreates the renderer/context before retrying with a smaller chunk size after CUDA OOM. If `--output` has an extension, the stem is used as the output directory. If it has no extension, that path is treated as the output directory directly.
+This writes one image per view under `outputs/multiview/`, plus `multiview_report.txt` and `multiview.log`. The multi-view CLI reuses one `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context sequentially for the whole run, stages up to `--multi-view-chunk-size` views per chunk, and recreates the renderer/context before retrying with a smaller chunk size after CUDA OOM. If `--output` has an extension, the stem is used as the output directory. If it has no extension, that path is treated as the output directory directly.
 
 Canonical six-view render:
 
@@ -142,7 +142,7 @@ nvdiffrast-mesh-render-batch \
     --view-chunk-sizes 24,8,4,2,1
 ```
 
-Batch mode runs one long-lived worker process per GPU. Each worker reuses one active `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context for sequential rendering, clears mesh/material texture caches between jobs, keeps environment-map/background helpers in separate bounded worker-local caches, and recreates the renderer/context before retrying after CUDA OOM or other CUDA failures.
+Batch mode runs one long-lived worker process per GPU. Each worker reuses one active `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context for sequential rendering, clears mesh/material texture caches between jobs, keeps environment-map/background helpers in separate bounded worker-local caches, recreates the renderer/context before retrying after CUDA OOM or other CUDA failures, and appends operational logs to `batch.log`.
 
 Double-sided meshes default to bounded depth peeling with up to 4 layers per winding bucket. Reduce or disable it with `--double-sided-depth-peels 1` if you need the older single-layer front/back behavior.
 
@@ -185,6 +185,7 @@ Input / output:
 - `--render-all`
 - `--canonical-six-views`
 - `--multi-view-chunk-size`
+- `--print`
 
 Camera:
 

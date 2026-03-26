@@ -8,6 +8,7 @@ import torch
 
 from .config import RenderConfig
 from .environment import EnvironmentService
+from .logging_utils import RunLogger
 from .renderer import SceneRenderer
 from .textures import TextureCache
 
@@ -27,6 +28,7 @@ _CACHE_KEY_EXCLUDED_FIELDS = frozenset(
         "multi_view_chunk_size",
         "render_all",
         "display",
+        "print_progress",
         "benchmark_requested",
         "benchmark_runs",
         "benchmark_warmup_runs",
@@ -83,8 +85,9 @@ def renderer_cache_key(config: RenderConfig) -> str:
 
 
 class RendererCache:
-    def __init__(self, *, device: torch.device | None = None):
+    def __init__(self, *, device: torch.device | None = None, logger: RunLogger | None = None):
         self.device = torch.device("cuda") if device is None else torch.device(device)
+        self.logger = logger
         # Env maps and background helpers are process/GPU-scoped, while mesh textures stay renderer/job-scoped.
         self._environment_service = EnvironmentService(TextureCache(self.device, max_file_entries=4))
         self._active_key: str | None = None
@@ -102,7 +105,7 @@ class RendererCache:
         if self._active_renderer is not None and self._active_key == key:
             return self._active_renderer
         self._discard_active_renderer()
-        renderer = SceneRenderer(config, device=self.device, environment_service=self._environment_service)
+        renderer = SceneRenderer(config, device=self.device, environment_service=self._environment_service, logger=self.logger)
         self._active_renderer = renderer
         self._active_key = key
         return renderer

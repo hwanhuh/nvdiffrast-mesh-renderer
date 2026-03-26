@@ -86,6 +86,7 @@ class RenderConfig:
     cull_mode: str
     antialias: bool
     display: bool
+    print_progress: bool
     render_mode: str
     wireframe_color: np.ndarray
     wireframe_opacity: float
@@ -268,6 +269,7 @@ def add_render_arguments(
     parser.add_argument("--no-antialias", action="store_true", help="Disable edge antialiasing")
     if include_display:
         parser.add_argument("--display", action="store_true", help="Display the result in an OpenGL window")
+    parser.add_argument("--print", dest="print_progress", action="store_true", help="Echo raw progress/report logs to stdout in addition to writing a .log file")
     return parser
 
 
@@ -319,6 +321,7 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         cull_mode=str(getattr(args, "cull_mode", "auto")),
         antialias=not bool(getattr(args, "no_antialias", False)),
         display=bool(getattr(args, "display", False)),
+        print_progress=bool(getattr(args, "print_progress", False)),
         render_mode=str(getattr(args, "render_mode", "beauty")),
         wireframe_color=parse_rgb(getattr(args, "wireframe_color", "0.2,1.0,0.25")),
         wireframe_opacity=float(np.clip(getattr(args, "wireframe_opacity", 1.0), 0.0, 1.0)),

@@ -16,6 +16,7 @@ from .environment import EnvironmentService
 from .geometry_pass import GeometryPassRenderer
 from .geometry_utils import scene_bounds
 from .ibl import ImageBasedLighting
+from .logging_utils import RunLogger
 from .postprocess import ImagePostprocessor
 from .scene_builder import SceneBuilder
 from .textures import TextureCache
@@ -59,9 +60,11 @@ class SceneRenderer:
         config: RenderConfig,
         device: torch.device | None = None,
         environment_service: EnvironmentService | None = None,
+        logger: RunLogger | None = None,
     ):
         self.config = config
         self.device = torch.device("cuda") if device is None else torch.device(device)
+        self.logger = logger
         self.glctx = dr.RasterizeCudaContext(device=self.device)
         # Mesh/material textures are renderer-local so batch jobs can clear them aggressively between meshes.
         self.cache = TextureCache(self.device)
@@ -76,6 +79,10 @@ class SceneRenderer:
         self.compositor = LayerCompositor()
         self.postprocessor = ImagePostprocessor(config)
 
+    def _log(self, message: str) -> None:
+        if self.logger is not None:
+            self.logger.log(message)
+
     def clear_texture_cache(self) -> None:
         self.cache.clear()
 
@@ -84,7 +91,7 @@ class SceneRenderer:
         if not meshes:
             raise RuntimeError(f"No renderable meshes found in {input_path}")
         pbr_count = sum(mesh.material.workflow == "pbr" for mesh in meshes)
-        print(f"Loaded {len(meshes)} mesh(es): {pbr_count} PBR, {len(meshes) - pbr_count} diffuse")
+        self._log(f"Loaded {len(meshes)} mesh(es): {pbr_count} PBR, {len(meshes) - pbr_count} diffuse")
         center, radius = scene_bounds(meshes)
         lights = self.scene_builder.build_lights(self.config.light_intensity)
         env = self.environment.build(self.config)
@@ -127,7 +134,7 @@ class SceneRenderer:
     def save_image(self, image, output_path: pathlib.Path) -> pathlib.Path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         self.postprocessor.save(output_path, image)
-        print(f"Saved render to {output_path}")
+        self._log(f"Saved render to {output_path}")
         if self.config.display:
             util.display_image(image[..., :3], size=self.config.resolution, title=str(output_path))
         return output_path

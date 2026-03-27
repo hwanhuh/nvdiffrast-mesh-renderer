@@ -156,8 +156,12 @@ Supported `--render-mode` values:
 - `normal_world`
 - `normal_view`
 - `face_normal`
+- `normal_ogl`
 - `depth_ndc`
 - `depth_linear`
+- `depth_ogl`
+- `position_ogl`
+- `confidence_ogl`
 - `mask`
 - `triangle_id`
 - `uv`
@@ -173,6 +177,8 @@ Notes:
 - normal outputs are encoded from `[-1, 1]` to `[0, 1]`
 - `depth_ndc` comes from `rast[..., 2]`
 - `depth_linear` comes from `-view_pos.z`
+- `depth_ogl` remaps `rast[..., 2]` from `[-1, 1]` to OpenGL depth-buffer space `[0, 1]`
+- `normal_ogl`, `position_ogl`, and `confidence_ogl` match the axis-swizzle and dot-product logic from `ogl_renderer.py`
 - `--normalize-depth` is intended for visualization/export, not raw metric depth output
 - `wireframe` uses analytic barycentric coverage, not ad hoc edge drawing and not `dr.antialias()` for interior edges
 

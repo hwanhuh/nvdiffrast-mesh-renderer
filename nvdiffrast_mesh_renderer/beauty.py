@@ -29,8 +29,12 @@ class RenderModeRenderer:
         "normal_world",
         "normal_view",
         "face_normal",
+        "normal_ogl",
         "depth_ndc",
         "depth_linear",
+        "depth_ogl",
+        "position_ogl",
+        "confidence_ogl",
         "mask",
         "triangle_id",
         "uv",
@@ -77,10 +81,18 @@ class RenderModeRenderer:
             return self._render_buffer(self._encode_normal(self._oriented_view_normal(layer)), alpha, gbuf)
         if mode_name == "face_normal":
             return self._render_buffer(self._encode_normal(self._oriented_face_normal(layer)), alpha, gbuf)
+        if mode_name == "normal_ogl":
+            return self._render_buffer(self._encode_normal(self._transform_ogl_axes(gbuf.normal_world)), alpha, gbuf)
         if mode_name == "depth_ndc":
             return self._render_scalar_buffer(gbuf.rast[..., 2:3], alpha, gbuf, clamp_rgb_min=False)
         if mode_name == "depth_linear":
             return self._render_scalar_buffer(self._resolve_depth(gbuf), alpha, gbuf, clamp_rgb_min=False)
+        if mode_name == "depth_ogl":
+            return self._render_scalar_buffer(self._resolve_depth_ogl(gbuf), alpha, gbuf)
+        if mode_name == "position_ogl":
+            return self._render_buffer(self._encode_position_ogl(gbuf.world_pos), alpha, gbuf)
+        if mode_name == "confidence_ogl":
+            return self._render_scalar_buffer(self._resolve_confidence_ogl(gbuf, camera), alpha, gbuf)
         if mode_name == "mask":
             return self._render_scalar_buffer(torch.ones_like(alpha), alpha, gbuf)
         if mode_name == "triangle_id":
@@ -251,8 +263,23 @@ class RenderModeRenderer:
     def _resolve_depth(self, gbuf) -> torch.Tensor:
         return torch.where(gbuf.valid, -gbuf.view_pos[..., 2:3], torch.zeros_like(gbuf.valid, dtype=gbuf.view_pos.dtype))
 
+    def _resolve_depth_ogl(self, gbuf) -> torch.Tensor:
+        return torch.clamp(gbuf.rast[..., 2:3] * 0.5 + 0.5, 0.0, 1.0)
+
+    def _resolve_confidence_ogl(self, gbuf, camera: CameraData) -> torch.Tensor:
+        camera_direction = safe_normalize(camera.position.view(1, 1, 1, 3) - gbuf.world_pos)
+        return torch.sum(gbuf.normal_world * camera_direction, dim=-1, keepdim=True)
+
     def _encode_normal(self, normal: torch.Tensor) -> torch.Tensor:
         return normal * 0.5 + 0.5
+
+    def _encode_position_ogl(self, position: torch.Tensor) -> torch.Tensor:
+        transformed_position = self._transform_ogl_axes(position)
+        position_color = transformed_position * 0.5 + 0.5
+        return torch.clamp((position_color - 0.5) * 1.5 + 0.5, 0.0, 1.0)
+
+    def _transform_ogl_axes(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.cat([value[..., 0:1], -value[..., 2:3], value[..., 1:2]], dim=-1)
 
     def _smoothstep(self, edge0: torch.Tensor, edge1: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         t = torch.clamp((x - edge0) / torch.clamp(edge1 - edge0, min=1e-6), 0.0, 1.0)

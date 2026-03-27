@@ -118,6 +118,13 @@ class RenderAllBatchConfigTests(unittest.TestCase):
 
         self.assertEqual(config.png_compression, 2)
 
+    def test_config_accepts_ogl_render_modes(self):
+        parser = build_argparser()
+
+        for mode in ("depth_ogl", "normal_ogl", "position_ogl", "confidence_ogl"):
+            config = config_from_args(parser.parse_args(["example.glb", "--render-mode", mode]))
+            self.assertEqual(config.render_mode, mode)
+
     def test_config_parses_texture_map_max_size(self):
         parser = build_argparser()
         args = parser.parse_args(["example.glb", "--texture-map-max-size", "2048"])

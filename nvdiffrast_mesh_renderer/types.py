@@ -53,6 +53,8 @@ class CameraData:
     mvp: torch.Tensor
     position: torch.Tensor
     cam_to_world: torch.Tensor
+    forward: torch.Tensor
+    projection_type: str
 
 
 @dataclass

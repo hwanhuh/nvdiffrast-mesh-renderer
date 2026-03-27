@@ -25,6 +25,7 @@ _CACHE_KEY_EXCLUDED_FIELDS = frozenset(
         "azim_end",
         "azim_step",
         "canonical_six_views",
+        "canonical_mv_conditions",
         "multi_view_chunk_size",
         "render_all",
         "render_all_batch_size",

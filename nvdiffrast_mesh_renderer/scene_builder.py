@@ -15,7 +15,7 @@ from .geometry_utils import (
     scene_bounds,
 )
 from .materials import GltfMaterialOverrides, MaterialExtractor, load_gltf_material_overrides, resize_scene_material_textures
-from .math_utils import look_at, orbit_camera, perspective, safe_normalize, safe_normalize_np
+from .math_utils import look_at, orbit_camera, orthographic, perspective, safe_normalize, safe_normalize_np
 from .textures import TextureCache
 from .types import CameraData, MeshData
 
@@ -96,29 +96,53 @@ class SceneBuilder:
 
     def build_camera(self, meshes: Sequence[MeshData], config: RenderConfig) -> CameraData:
         center, radius = scene_bounds(meshes)
-        eye, target, _distance = orbit_camera(center, radius, config.elev, config.azim, config.fov, config.distance_scale, config.distance)
+        eye, target, distance = orbit_camera(
+            center,
+            radius,
+            config.elev,
+            config.azim,
+            config.fov,
+            config.distance_scale,
+            config.distance,
+            projection_type=config.camera,
+        )
+        forward = safe_normalize_np(target - eye)
         view = look_at(eye, target, np.array([0.0, 1.0, 0.0], dtype=np.float32))
         near, far = self._clip_planes_from_meshes(meshes, view)
-        proj = perspective(config.fov, 1.0, near, far)
+        proj = self._projection_matrix(config, near, far, distance)
         return CameraData(
             view=torch.as_tensor(view, dtype=torch.float32, device=self.device),
             proj=torch.as_tensor(proj, dtype=torch.float32, device=self.device),
             mvp=torch.as_tensor(proj @ view, dtype=torch.float32, device=self.device),
             position=torch.as_tensor(eye, dtype=torch.float32, device=self.device),
             cam_to_world=torch.as_tensor(np.linalg.inv(view), dtype=torch.float32, device=self.device),
+            forward=torch.as_tensor(forward, dtype=torch.float32, device=self.device),
+            projection_type=config.camera,
         )
 
     def build_camera_from_bounds(self, center: np.ndarray, radius: float, config: RenderConfig) -> CameraData:
-        eye, target, distance = orbit_camera(center, radius, config.elev, config.azim, config.fov, config.distance_scale, config.distance)
+        eye, target, distance = orbit_camera(
+            center,
+            radius,
+            config.elev,
+            config.azim,
+            config.fov,
+            config.distance_scale,
+            config.distance,
+            projection_type=config.camera,
+        )
+        forward = safe_normalize_np(target - eye)
         near, far = self._clip_planes_from_depth_range(distance - radius, distance + radius)
         view = look_at(eye, target, np.array([0.0, 1.0, 0.0], dtype=np.float32))
-        proj = perspective(config.fov, 1.0, near, far)
+        proj = self._projection_matrix(config, near, far, distance)
         return CameraData(
             view=torch.as_tensor(view, dtype=torch.float32, device=self.device),
             proj=torch.as_tensor(proj, dtype=torch.float32, device=self.device),
             mvp=torch.as_tensor(proj @ view, dtype=torch.float32, device=self.device),
             position=torch.as_tensor(eye, dtype=torch.float32, device=self.device),
             cam_to_world=torch.as_tensor(np.linalg.inv(view), dtype=torch.float32, device=self.device),
+            forward=torch.as_tensor(forward, dtype=torch.float32, device=self.device),
+            projection_type=config.camera,
         )
 
     def build_lights(self, strength: float) -> List[Tuple[torch.Tensor, torch.Tensor]]:
@@ -202,3 +226,8 @@ class SceneBuilder:
         near = max(0.01, depth_min * 0.95)
         far = max(near + 1.0, depth_max * 1.05)
         return near, far
+
+    def _projection_matrix(self, config: RenderConfig, near: float, far: float, distance: float) -> np.ndarray:
+        if config.camera == "orthographic":
+            return orthographic(distance, 1.0, near, far)
+        return perspective(config.fov, 1.0, near, far)

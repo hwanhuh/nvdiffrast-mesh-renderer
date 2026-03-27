@@ -92,8 +92,9 @@ class CliTimingReportTests(unittest.TestCase):
                 "input": "mesh.glb",
                 "resolution": 512,
                 "render_mode": "beauty",
+                "canonical_mv_conditions": False,
             })(),
-            [(0, "front", 0.0, 0.0, pathlib.Path("outputs/0000_front.png"))],
+            [(0, "front", 0.0, 0.0, "beauty", pathlib.Path("outputs/0000_front.png"))],
             "4",
             timing,
         )
@@ -101,6 +102,8 @@ class CliTimingReportTests(unittest.TestCase):
         self.assertIn("Timing Summary", report)
         self.assertIn("data_loading: 300ms", report)
         self.assertIn("save: 400ms", report)
+        self.assertIn("render_modes: beauty", report)
+        self.assertIn("output_count: 1", report)
 
 
 if __name__ == "__main__":

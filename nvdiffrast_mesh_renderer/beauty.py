@@ -116,7 +116,7 @@ class RenderModeRenderer:
         material = mesh.material
         normal = self._resolve_shading_normal(layer)
         face_normal = self._oriented_face_normal(layer)
-        view_dir = safe_normalize(camera.position.view(1, 1, 1, 3) - gbuf.world_pos)
+        view_dir = self._resolve_view_dir(gbuf, camera)
         base_rgb = torch.clamp(gbuf.base_rgba[..., :3], min=0.0)
         alpha = self._resolve_alpha(layer)
         shaded = self._shade(material.workflow, base_rgb, normal, face_normal, view_dir, gbuf.emissive, gbuf.ao, gbuf.roughness, gbuf.metallic, gbuf)
@@ -267,7 +267,7 @@ class RenderModeRenderer:
         return torch.clamp(gbuf.rast[..., 2:3] * 0.5 + 0.5, 0.0, 1.0)
 
     def _resolve_confidence_ogl(self, gbuf, camera: CameraData) -> torch.Tensor:
-        camera_direction = safe_normalize(camera.position.view(1, 1, 1, 3) - gbuf.world_pos)
+        camera_direction = self._resolve_view_dir(gbuf, camera)
         return torch.sum(gbuf.normal_world * camera_direction, dim=-1, keepdim=True)
 
     def _encode_normal(self, normal: torch.Tensor) -> torch.Tensor:
@@ -280,6 +280,11 @@ class RenderModeRenderer:
 
     def _transform_ogl_axes(self, value: torch.Tensor) -> torch.Tensor:
         return torch.cat([value[..., 0:1], -value[..., 2:3], value[..., 1:2]], dim=-1)
+
+    def _resolve_view_dir(self, gbuf, camera: CameraData) -> torch.Tensor:
+        if getattr(camera, "projection_type", "perspective") == "orthographic":
+            return (-camera.forward).view(1, 1, 1, 3).expand_as(gbuf.world_pos)
+        return safe_normalize(camera.position.view(1, 1, 1, 3) - gbuf.world_pos)
 
     def _smoothstep(self, edge0: torch.Tensor, edge1: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         t = torch.clamp((x - edge0) / torch.clamp(edge1 - edge0, min=1e-6), 0.0, 1.0)

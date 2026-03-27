@@ -133,6 +133,17 @@ nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff2
 
 This writes `front`, `back`, `left`, `right`, `top`, and `bottom` view images into the output directory. In this mode the renderer first tries one chunk of 6 views, and if that hits CUDA OOM it recreates the renderer/context and retries with chunk sizes 2 and then 1 if needed.
 
+Canonical six-view condition render:
+
+```bash
+nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff21_1024.glb \
+    --output outputs/canonical_mv_conditions \
+    --resolution 1024 \
+    --canonical-mv-conditions
+```
+
+This writes 24 images into the output directory: `normal_ogl` and `position_ogl` for each of 12 canonical views (`front/back/left/right/top/bottom` plus `front2/right2/back2/left2/top2/bottom2`). This mode uses a smaller initial chunk size of 8 views instead of trying all 12 at once.
+
 Manifest-driven batch render:
 
 ```bash
@@ -145,7 +156,7 @@ nvdiffrast-mesh-render-batch \
 
 Batch mode runs one long-lived worker process per GPU. Each worker reuses one active `SceneRenderer` and one `nvdiffrast` CUDA rasterizer context for sequential rendering, clears mesh/material texture caches between jobs, keeps environment-map/background helpers in separate bounded worker-local caches, recreates the renderer/context before retrying after CUDA OOM or other CUDA failures, and appends operational logs to `batch.log`.
 
-Double-sided meshes default to bounded depth peeling with up to 4 layers per winding bucket. Reduce or disable it with `--double-sided-depth-peels 1` if you need the older single-layer front/back behavior.
+Double-sided meshes default to bounded depth peeling with up to 2 layers per winding bucket. Reduce or disable it with `--double-sided-depth-peels 1` if you need the older single-layer front/back behavior.
 
 ## Render Modes
 
@@ -178,7 +189,7 @@ Notes:
 - `depth_ndc` comes from `rast[..., 2]`
 - `depth_linear` comes from `-view_pos.z`
 - `depth_ogl` remaps `rast[..., 2]` from `[-1, 1]` to OpenGL depth-buffer space `[0, 1]`
-- `normal_ogl`, `position_ogl`, and `confidence_ogl` match the axis-swizzle and dot-product logic from `ogl_renderer.py`
+- `normal_ogl`, `position_ogl`, and `confidence_ogl` match the axis-swizzle and dot-product logic
 - `--normalize-depth` is intended for visualization/export, not raw metric depth output
 - `wireframe` uses analytic barycentric coverage, not ad hoc edge drawing and not `dr.antialias()` for interior edges
 
@@ -191,6 +202,7 @@ Input / output:
 - `--resolution`
 - `--render-all`
 - `--canonical-six-views`
+- `--canonical-mv-conditions`
 - `--multi-view-chunk-size`
 - `--print`
 
@@ -204,9 +216,12 @@ Camera:
 - `--azim-start`
 - `--azim-end`
 - `--azim-step`
+- `--camera {perspective,orthographic}`
 - `--fov`
 - `--distance`
 - `--distance-scale`
+
+`--camera orthographic` uses an orthographic projection, ignores `--fov`, and derives framing from camera distance instead.
 
 Environment / background:
 
@@ -542,6 +557,7 @@ args = Namespace(
     resolution=512,
     elev=0.0,
     azim=0.0,
+    camera="perspective",
     fov=45.0,
     distance=None,
     distance_scale=1.15,
@@ -578,7 +594,7 @@ SceneRenderer(config).render_to_file()
 - `--render-all` remains a validation/inspection workflow rather than the multi-GPU batch path. Normal runs batch a few modes per shared geometry pass for speed, while benchmark runs still re-render once per mode for timing fidelity.
 - Multi-view rendering currently cannot be combined with `--render-all`.
 - `--display` is not meaningful for multi-view rendering because the view grid is emitted as files.
-- `--canonical-six-views` cannot be combined with explicit multi-view range flags such as `--azim-start` or `--elev-start`.
+- `--canonical-six-views` and `--canonical-mv-conditions` cannot be combined with explicit multi-view range flags such as `--azim-start` or `--elev-start`.
 - There is no support for animation, skinning, morph targets, or multi-camera scenes.
 - Hidden-line and multi-layer rendering are not implemented yet, though the raster path is structured so `nvdiffrast` DepthPeeler can be introduced later.
 

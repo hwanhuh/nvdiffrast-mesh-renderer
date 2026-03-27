@@ -1,7 +1,15 @@
+import pathlib
 import unittest
 from types import SimpleNamespace
 
-from nvdiffrast_mesh_renderer.cli import _render_all_mode_batch_sizes
+from nvdiffrast_mesh_renderer.cli import (
+    _is_multi_view,
+    _multi_view_output_path,
+    _multi_view_specs,
+    _multiview_chunk_sizes,
+    _multiview_render_modes,
+    _render_all_mode_batch_sizes,
+)
 from nvdiffrast_mesh_renderer.config import build_argparser, config_from_args
 from nvdiffrast_mesh_renderer.renderer import SceneRenderer
 
@@ -125,12 +133,84 @@ class RenderAllBatchConfigTests(unittest.TestCase):
             config = config_from_args(parser.parse_args(["example.glb", "--render-mode", mode]))
             self.assertEqual(config.render_mode, mode)
 
+    def test_config_parses_orthographic_camera(self):
+        parser = build_argparser()
+        config = config_from_args(parser.parse_args(["example.glb", "--camera", "orthographic"]))
+
+        self.assertEqual(config.camera, "orthographic")
+
+    def test_config_parses_canonical_mv_conditions(self):
+        parser = build_argparser()
+        config = config_from_args(parser.parse_args(["example.glb", "--canonical-mv-conditions"]))
+
+        self.assertTrue(config.canonical_mv_conditions)
+
     def test_config_parses_texture_map_max_size(self):
         parser = build_argparser()
         args = parser.parse_args(["example.glb", "--texture-map-max-size", "2048"])
         config = config_from_args(args)
 
         self.assertEqual(config.texture_map_max_size, 2048)
+
+
+class MultiViewConfigTests(unittest.TestCase):
+    def test_canonical_mv_conditions_trigger_multiview(self):
+        config = SimpleNamespace(
+            canonical_six_views=False,
+            canonical_mv_conditions=True,
+            azim_start=None,
+            azim_end=None,
+            azim_step=None,
+            elev_start=None,
+            elev_end=None,
+            elev_step=None,
+        )
+
+        self.assertTrue(_is_multi_view(config))
+
+    def test_canonical_mv_conditions_use_twelve_specs(self):
+        config = SimpleNamespace(
+            canonical_six_views=False,
+            canonical_mv_conditions=True,
+            elev=0.0,
+            azim=0.0,
+            elev_start=None,
+            elev_end=None,
+            elev_step=None,
+            azim_start=None,
+            azim_end=None,
+            azim_step=None,
+        )
+
+        specs = _multi_view_specs(config)
+
+        self.assertEqual(len(specs), 12)
+        self.assertEqual(specs[0][1], "front")
+        self.assertEqual(specs[6][1], "front2")
+        self.assertEqual(specs[-1][1], "bottom2")
+
+    def test_canonical_mv_conditions_use_normal_and_position_modes(self):
+        config = SimpleNamespace(canonical_mv_conditions=True, render_mode="beauty")
+
+        self.assertEqual(_multiview_render_modes(config), ("normal_ogl", "position_ogl"))
+
+    def test_canonical_mv_conditions_use_chunk_size_eight_fallbacks(self):
+        config = SimpleNamespace(canonical_mv_conditions=True, canonical_six_views=False, multi_view_chunk_size=24)
+
+        self.assertEqual(_multiview_chunk_sizes(config), (8, 4, 2, 1))
+
+    def test_multiview_output_path_includes_mode_suffix_when_needed(self):
+        path = _multi_view_output_path(
+            output_dir=pathlib.Path("outputs"),
+            suffix=".png",
+            index=0,
+            elev=0.0,
+            azim=0.0,
+            label="front",
+            mode="normal_ogl",
+        )
+
+        self.assertEqual(path, pathlib.Path("outputs/0000_front_normal_ogl.png"))
 
 
 if __name__ == "__main__":

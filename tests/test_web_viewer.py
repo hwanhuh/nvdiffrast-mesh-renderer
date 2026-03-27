@@ -1,6 +1,6 @@
 import unittest
 
-from web_viewer import DEFAULT_BACKGROUND_HEX, _parse_background_hex
+from web_viewer import DEFAULT_BACKGROUND_HEX, PAGE_HTML, _parse_background_hex
 
 
 class WebViewerTests(unittest.TestCase):
@@ -14,11 +14,16 @@ class WebViewerTests(unittest.TestCase):
         normalized, rgb = _parse_background_hex(None)
 
         self.assertEqual(normalized, DEFAULT_BACKGROUND_HEX)
-        self.assertEqual(rgb, (255, 255, 255))
+        self.assertEqual(rgb, (0xBC, 0xBC, 0xBC))
 
     def test_parse_background_hex_rejects_invalid_color(self):
         with self.assertRaises(ValueError):
             _parse_background_hex("white")
+
+    def test_page_exposes_camera_selector(self):
+        self.assertIn('id="cameraInput"', PAGE_HTML)
+        self.assertIn('value="perspective"', PAGE_HTML)
+        self.assertIn('value="orthographic"', PAGE_HTML)
 
 
 if __name__ == "__main__":

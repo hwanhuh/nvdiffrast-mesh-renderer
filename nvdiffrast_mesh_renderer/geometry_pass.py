@@ -23,7 +23,7 @@ class GeometryPassRenderer:
             mesh.faces,
             mesh.positions,
             mesh.face_normals,
-            camera.position,
+            camera,
         )
         cull_backfaces = self.config.cull_mode == "force" or (self.config.cull_mode == "auto" and not mesh.material.double_sided)
         front_layer_limit = 1 if cull_backfaces else self.config.double_sided_depth_peels
@@ -159,10 +159,14 @@ class GeometryPassRenderer:
         faces: torch.Tensor,
         positions: torch.Tensor,
         face_normals: torch.Tensor,
-        camera_position: torch.Tensor,
+        camera,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         tri_centroids = positions[faces].mean(dim=1)
-        view_dir = camera_position.view(1, 3) - tri_centroids
+        if getattr(camera, "projection_type", "perspective") == "orthographic":
+            view_dir = (-camera.forward).view(1, 3).expand_as(tri_centroids)
+        else:
+            camera_position = camera if isinstance(camera, torch.Tensor) else camera.position
+            view_dir = camera_position.view(1, 3) - tri_centroids
         front_mask = torch.sum(face_normals * view_dir, dim=-1) >= 0.0
         if front_mask.all():
             return faces, face_normals, faces.new_zeros((0, 3)), face_normals.new_zeros((0, 3))

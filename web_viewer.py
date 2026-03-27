@@ -260,6 +260,10 @@ PAGE_HTML = """<!doctype html>
       gap: 8px;
     }
 
+    .slider-block.disabled {
+      opacity: 0.58;
+    }
+
     .slider-line {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -517,6 +521,14 @@ PAGE_HTML = """<!doctype html>
           </label>
 
           <label class="slider-block">
+            Camera Type
+            <select id="cameraInput">
+              <option value="perspective">perspective</option>
+              <option value="orthographic">orthographic</option>
+            </select>
+          </label>
+
+          <label class="slider-block">
             FOV
             <div class="slider-line">
               <input id="fovInput" type="range" min="15" max="90" step="1" value="45">
@@ -563,7 +575,7 @@ PAGE_HTML = """<!doctype html>
 
   <script>
     window.__VIEWER_STATE__ = __INITIAL_VIEWER_STATE__;
-    const defaults = { elev: 15, azim: 35, distance: 1.15, fov: 45, mode: "beauty", background: "#ffffff" };
+    const defaults = { elev: 15, azim: 35, distance: 1.15, camera: "perspective", fov: 45, mode: "beauty", background: "#bcbcbc" };
     const apiBase = new URL(".", window.location.href);
     const state = {
       meshId: null,
@@ -586,6 +598,7 @@ PAGE_HTML = """<!doctype html>
     const elevInput = document.getElementById("elevInput");
     const azimInput = document.getElementById("azimInput");
     const distanceInput = document.getElementById("distanceInput");
+    const cameraInput = document.getElementById("cameraInput");
     const fovInput = document.getElementById("fovInput");
     const backgroundColorInput = document.getElementById("backgroundColorInput");
     const elevValue = document.getElementById("elevValue");
@@ -628,7 +641,10 @@ PAGE_HTML = """<!doctype html>
       elevValue.textContent = `${Number(elevInput.value).toFixed(1)}°`;
       azimValue.textContent = `${Number(azimInput.value).toFixed(1)}°`;
       distanceValue.textContent = `${Number(distanceInput.value).toFixed(2)}x`;
-      fovValue.textContent = `${Number(fovInput.value).toFixed(1)}°`;
+      const orthographic = cameraInput.value === "orthographic";
+      fovInput.disabled = orthographic;
+      fovInput.closest(".slider-block")?.classList.toggle("disabled", orthographic);
+      fovValue.textContent = orthographic ? "ignored" : `${Number(fovInput.value).toFixed(1)}°`;
       backgroundColorValue.textContent = backgroundColorInput.value.toLowerCase();
       modeLabel.textContent = state.mode;
     }
@@ -647,6 +663,7 @@ PAGE_HTML = """<!doctype html>
         elev: Number(elevInput.value),
         azim: Number(azimInput.value),
         distance_scale: Number(distanceInput.value),
+        camera: cameraInput.value,
         fov: Number(fovInput.value),
         background_hex: backgroundColorInput.value,
       };
@@ -845,6 +862,7 @@ PAGE_HTML = """<!doctype html>
       updateSliderValue(elevInput, defaults.elev);
       updateSliderValue(azimInput, defaults.azim);
       updateSliderValue(distanceInput, defaults.distance);
+      cameraInput.value = defaults.camera;
       updateSliderValue(fovInput, defaults.fov);
       applyBackgroundColor(defaults.background);
       queueFinalRender(0);
@@ -866,6 +884,7 @@ PAGE_HTML = """<!doctype html>
     elevInput.addEventListener("input", onControlInput);
     azimInput.addEventListener("input", onControlInput);
     distanceInput.addEventListener("input", onControlInput);
+    cameraInput.addEventListener("change", onControlInput);
     fovInput.addEventListener("input", onControlInput);
     backgroundColorInput.addEventListener("input", () => {
       applyBackgroundColor(backgroundColorInput.value);
@@ -921,12 +940,14 @@ PAGE_HTML = """<!doctype html>
         defaults.elev = payload.defaults.elev;
         defaults.azim = payload.defaults.azim;
         defaults.distance = payload.defaults.distance_scale;
+        defaults.camera = payload.defaults.camera || "perspective";
         defaults.fov = payload.defaults.fov;
         defaults.mode = payload.defaults.render_mode;
-        defaults.background = payload.defaults.background_hex || "#ffffff";
+        defaults.background = payload.defaults.background_hex || "#bcbcbc";
         updateSliderValue(elevInput, defaults.elev);
         updateSliderValue(azimInput, defaults.azim);
         updateSliderValue(distanceInput, defaults.distance);
+        cameraInput.value = defaults.camera;
         updateSliderValue(fovInput, defaults.fov);
         applyBackgroundColor(defaults.background);
         state.mode = defaults.mode;
@@ -949,7 +970,7 @@ PAGE_HTML = """<!doctype html>
 
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 SUPPORTED_UPLOAD_SUFFIXES = {".glb", ".gltf"}
-DEFAULT_BACKGROUND_HEX = "#ffffff"
+DEFAULT_BACKGROUND_HEX = "#bcbcbc"
 VIEWER_JPG_QUALITY = 90
 
 
@@ -995,7 +1016,7 @@ class ViewerBackend:
             raise RuntimeError("PyTorch is required to run the web viewer.") from exc
 
         try:
-            from nvdiffrast_mesh_renderer.config import RENDER_MODE_CHOICES, config_from_args
+            from nvdiffrast_mesh_renderer.config import CAMERA_CHOICES, RENDER_MODE_CHOICES, config_from_args
             from nvdiffrast_mesh_renderer.lifecycle import is_cuda_failure
             from nvdiffrast_mesh_renderer.renderer import SceneRenderer
         except ImportError as exc:  # pragma: no cover - environment issue
@@ -1010,6 +1031,7 @@ class ViewerBackend:
         self._config_from_args = config_from_args
         self._SceneRenderer = SceneRenderer
         self._is_cuda_failure = is_cuda_failure
+        self.camera_choices = tuple(CAMERA_CHOICES)
         self.render_modes = tuple(RENDER_MODE_CHOICES)
         self.repo_root = Path(__file__).resolve().parent
         self.example_dir = (self.repo_root / args.example_dir).resolve()
@@ -1030,6 +1052,7 @@ class ViewerBackend:
             "elev": 15.0,
             "azim": 35.0,
             "distance_scale": 1.15,
+            "camera": "perspective",
             "fov": 45.0,
             "render_mode": "beauty",
             "background_hex": DEFAULT_BACKGROUND_HEX,
@@ -1078,6 +1101,7 @@ class ViewerBackend:
             azim_start=None,
             azim_end=None,
             azim_step=None,
+            camera=self.defaults["camera"],
             fov=self.defaults["fov"],
             distance=None,
             distance_scale=self.defaults["distance_scale"],
@@ -1204,12 +1228,15 @@ class ViewerBackend:
         elev: float,
         azim: float,
         distance_scale: float,
+        camera: str,
         fov: float,
         background_hex: str = DEFAULT_BACKGROUND_HEX,
         preview: bool = False,
     ) -> tuple[bytes, str, float, int]:
         if render_mode not in self.render_modes:
             raise ValueError(f"Unsupported render mode: {render_mode}")
+        if camera not in self.camera_choices:
+            raise ValueError(f"Unsupported camera type: {camera}")
         if not (0.5 <= distance_scale <= 4.0):
             raise ValueError("distance_scale must stay between 0.5 and 4.0.")
         if not (10.0 <= fov <= 100.0):
@@ -1224,6 +1251,7 @@ class ViewerBackend:
                 input=str(self._mesh_path(mesh_id)),
                 elev=float(elev),
                 azim=float(azim),
+                camera=str(camera),
                 fov=float(fov),
                 distance=None,
                 distance_scale=float(distance_scale),
@@ -1242,6 +1270,7 @@ class ViewerBackend:
                     input=str(self._mesh_path(mesh_id)),
                     elev=float(elev),
                     azim=float(azim),
+                    camera=str(camera),
                     fov=float(fov),
                     distance=None,
                     distance_scale=float(distance_scale),
@@ -1352,6 +1381,7 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
                 elev=float(payload["elev"]),
                 azim=float(payload["azim"]),
                 distance_scale=float(payload["distance_scale"]),
+                camera=str(payload.get("camera", "perspective")),
                 fov=float(payload["fov"]),
                 background_hex=str(payload.get("background_hex", DEFAULT_BACKGROUND_HEX)),
                 preview=bool(payload.get("preview", False)),

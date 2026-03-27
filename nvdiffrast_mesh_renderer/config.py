@@ -29,6 +29,7 @@ RENDER_MODE_CHOICES = (
 ENV_USAGE_CHOICES = ("light", "background", "both")
 TONEMAP_CHOICES = ("aces", "reinhard", "none")
 CULL_MODE_CHOICES = ("auto", "off", "force")
+CAMERA_CHOICES = ("perspective", "orthographic")
 GEOMETRY_PREPROCESS_DEVICE_CHOICES = ("auto", "cpu", "cuda")
 
 BATCH_OVERRIDE_KEYS = frozenset(
@@ -36,6 +37,7 @@ BATCH_OVERRIDE_KEYS = frozenset(
         "resolution",
         "render_mode",
         "png_compression",
+        "camera",
         "fov",
         "distance",
         "distance_scale",
@@ -75,6 +77,7 @@ class RenderConfig:
     azim_start: Optional[float]
     azim_end: Optional[float]
     azim_step: Optional[float]
+    camera: str
     fov: float
     distance: Optional[float]
     distance_scale: float
@@ -103,6 +106,7 @@ class RenderConfig:
     render_all: bool
     render_all_batch_size: int
     canonical_six_views: bool
+    canonical_mv_conditions: bool
     multi_view_chunk_size: int
     geometry_preprocess_device: str
     geometry_cuda_threshold_faces: int
@@ -182,10 +186,10 @@ def _validate_multi_view_args(
     azim_end: Optional[float],
     azim_step: Optional[float],
 ) -> None:
-    if bool(getattr(args, "canonical_six_views", False)) and any(
+    if (bool(getattr(args, "canonical_six_views", False)) or bool(getattr(args, "canonical_mv_conditions", False))) and any(
         value is not None for value in (elev_start, elev_end, elev_step, azim_start, azim_end, azim_step)
     ):
-        raise ValueError("--canonical-six-views cannot be combined with explicit multi-view range arguments")
+        raise ValueError("--canonical-six-views/--canonical-mv-conditions cannot be combined with explicit multi-view range arguments")
 
 
 def add_render_arguments(
@@ -214,6 +218,7 @@ def add_render_arguments(
         parser.add_argument("--azim-start", type=float, default=None, help="Inclusive multi-view azimuth start in degrees")
         parser.add_argument("--azim-end", type=float, default=None, help="Inclusive multi-view azimuth end in degrees")
         parser.add_argument("--azim-step", type=float, default=None, help="Multi-view azimuth step in degrees")
+    parser.add_argument("--camera", choices=CAMERA_CHOICES, default="perspective", help="Projection type for rendering camera")
     parser.add_argument("--fov", type=float, default=45.0, help="Vertical field of view in degrees")
     parser.add_argument("--distance", type=float, default=None, help="Optional absolute camera distance override")
     parser.add_argument("--distance-scale", type=float, default=1.15, help="Automatic camera distance multiplier")
@@ -264,6 +269,11 @@ def add_render_arguments(
         )
     if include_canonical_six_views:
         parser.add_argument("--canonical-six-views", action="store_true", help="Render front, back, left, right, top, and bottom views in one multi-view run")
+        parser.add_argument(
+            "--canonical-mv-conditions",
+            action="store_true",
+            help="Render canonical six views for both normal_ogl and position_ogl conditions, producing 12 outputs.",
+        )
     if include_multi_view_chunk_size:
         parser.add_argument("--multi-view-chunk-size", type=int, default=4, help="Maximum number of views to stage per sequential multi-view chunk")
     parser.add_argument(
@@ -331,6 +341,7 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         azim_start=azim_start,
         azim_end=azim_end,
         azim_step=azim_step,
+        camera=str(getattr(args, "camera", "perspective")),
         fov=float(getattr(args, "fov", 45.0)),
         distance=getattr(args, "distance", None),
         distance_scale=float(getattr(args, "distance_scale", 1.15)),
@@ -359,6 +370,7 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         render_all=bool(getattr(args, "render_all", False)),
         render_all_batch_size=max(int(getattr(args, "render_all_batch_size", 4)), 1),
         canonical_six_views=bool(getattr(args, "canonical_six_views", False)),
+        canonical_mv_conditions=bool(getattr(args, "canonical_mv_conditions", False)),
         multi_view_chunk_size=max(int(getattr(args, "multi_view_chunk_size", 4)), 1),
         geometry_preprocess_device=str(getattr(args, "geometry_preprocess_device", "auto")),
         geometry_cuda_threshold_faces=max(int(getattr(args, "geometry_cuda_threshold_faces", 100000)), 0),
@@ -398,6 +410,9 @@ def config_with_overrides(base_config: RenderConfig, overrides: dict[str, Any]) 
             continue
         if key == "render_mode":
             updates[key] = _validate_choice(key, str(value), RENDER_MODE_CHOICES)
+            continue
+        if key == "camera":
+            updates[key] = _validate_choice(key, str(value), CAMERA_CHOICES)
             continue
         if key == "env_usage":
             updates[key] = _validate_choice(key, str(value), ENV_USAGE_CHOICES)

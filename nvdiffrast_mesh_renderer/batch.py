@@ -733,6 +733,7 @@ def _build_camera_entry(
     return {
         "index": view.index,
         "name": view.name,
+        "camera": view_config.camera,
         "elev_deg": _round(view.elev),
         "azim_deg": _round(view.azim),
         "distance": _round(distance),

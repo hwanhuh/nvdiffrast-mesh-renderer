@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -56,6 +57,27 @@ class GeometryPassFacingTests(unittest.TestCase):
         self.assertEqual(front_normals.numel(), 0)
         self.assertTrue(torch.equal(back_tri, faces))
         self.assertTrue(torch.equal(back_normals, face_normals))
+
+    def test_split_uses_orthographic_forward_direction(self):
+        faces = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        face_normals = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32)
+        camera = SimpleNamespace(
+            projection_type="orthographic",
+            forward=torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32),
+            position=torch.tensor([0.0, 0.0, -2.0], dtype=torch.float32),
+        )
+
+        front_tri, front_normals, back_tri, back_normals = self.renderer._split_triangles_by_facing(
+            faces,
+            self.positions,
+            face_normals,
+            camera,
+        )
+
+        self.assertTrue(torch.equal(front_tri, faces))
+        self.assertTrue(torch.equal(front_normals, face_normals))
+        self.assertEqual(back_tri.numel(), 0)
+        self.assertEqual(back_normals.numel(), 0)
 
 
 if __name__ == "__main__":

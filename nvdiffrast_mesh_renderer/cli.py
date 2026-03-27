@@ -20,6 +20,15 @@ CANONICAL_SIX_VIEW_SPECS = (
     ("top", 90.0, 0.0),
     ("bottom", -90.0, 0.0),
 )
+CANONICAL_OFFSET45_VIEW_SPECS = (
+    ("front2", 0.0, 135.0),
+    ("right2", 0.0, 45.0),
+    ("back2", 0.0, -45.0),
+    ("left2", 0.0, -135.0),
+    ("top2", 65.0, 135.0),
+    ("bottom2", -65.0, 135.0),
+)
+CANONICAL_MV_CONDITION_MODES = ("normal_ogl", "position_ogl")
 
 
 def build_argparser():
@@ -152,7 +161,7 @@ def _render_all_mode_batch_sizes(config, total_modes: int) -> tuple[int, ...]:
 
 
 def _is_multi_view(config) -> bool:
-    return config.canonical_six_views or any(
+    return config.canonical_six_views or getattr(config, "canonical_mv_conditions", False) or any(
         getattr(config, name) is not None
         for name in ("azim_start", "azim_end", "azim_step", "elev_start", "elev_end", "elev_step")
     )
@@ -184,6 +193,9 @@ def _multi_view_pairs(config) -> list[tuple[float, float]]:
 
 
 def _multi_view_specs(config) -> list[tuple[int, str | None, float, float]]:
+    if getattr(config, "canonical_mv_conditions", False):
+        combined_specs = CANONICAL_SIX_VIEW_SPECS + CANONICAL_OFFSET45_VIEW_SPECS
+        return [(index, label, elev, azim) for index, (label, elev, azim) in enumerate(combined_specs)]
     if config.canonical_six_views:
         return [(index, label, elev, azim) for index, (label, elev, azim) in enumerate(CANONICAL_SIX_VIEW_SPECS)]
     return [(index, None, elev, azim) for index, (elev, azim) in enumerate(_multi_view_pairs(config))]
@@ -193,33 +205,51 @@ def _format_angle(value: float) -> str:
     return f"{value:+07.2f}".replace("+", "p").replace("-", "m").replace(".", "_")
 
 
-def _multi_view_output_path(output_dir: pathlib.Path, suffix: str, index: int, elev: float, azim: float, label: str | None = None) -> pathlib.Path:
-    if label is not None:
-        return output_dir / f"{index:04d}_{label}{suffix}"
-    return output_dir / f"{index:04d}_elev_{_format_angle(elev)}_azim_{_format_angle(azim)}{suffix}"
+def _multi_view_output_path(
+    output_dir: pathlib.Path,
+    suffix: str,
+    index: int,
+    elev: float,
+    azim: float,
+    label: str | None = None,
+    mode: str | None = None,
+) -> pathlib.Path:
+    stem = f"{index:04d}_{label}" if label is not None else f"{index:04d}_elev_{_format_angle(elev)}_azim_{_format_angle(azim)}"
+    if mode is not None:
+        stem = f"{stem}_{mode}"
+    return output_dir / f"{stem}{suffix}"
+
+
+def _multiview_render_modes(config) -> tuple[str, ...]:
+    if getattr(config, "canonical_mv_conditions", False):
+        return CANONICAL_MV_CONDITION_MODES
+    return (config.render_mode,)
 
 
 def _format_multiview_report(
     config,
-    rows: list[tuple[int, str | None, float, float, pathlib.Path]],
+    rows: list[tuple[int, str | None, float, float, str, pathlib.Path]],
     chunk_size_info: str,
     timing: TimingBreakdown,
 ) -> str:
+    render_modes = sorted({mode for _index, _label, _elev, _azim, mode, _output_path in rows}) if rows else _multiview_render_modes(config)
+    view_count = len({index for index, _label, _elev, _azim, _mode, _output_path in rows})
     lines = [
         "Multi-View Render Report",
         f"input: {config.input}",
         f"resolution: {config.resolution}",
-        f"render_mode: {config.render_mode}",
+        f"render_modes: {', '.join(render_modes)}",
         f"chunk_size: {chunk_size_info}",
-        f"view_count: {len(rows)}",
+        f"view_count: {view_count}",
+        f"output_count: {len(rows)}",
         "",
         "Timing Summary",
         *_timing_summary_report_lines(timing),
         "",
-        "index | name | elev | azim | output",
+        "index | name | elev | azim | mode | output",
     ]
-    for index, label, elev, azim, output_path in rows:
-        lines.append(f"{index:04d} | {label or '-'} | {elev:.3f} | {azim:.3f} | {output_path}")
+    for index, label, elev, azim, mode, output_path in rows:
+        lines.append(f"{index:04d} | {label or '-'} | {elev:.3f} | {azim:.3f} | {mode} | {output_path}")
     return "\n".join(lines) + "\n"
 
 
@@ -432,6 +462,8 @@ def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
 
 
 def _multiview_chunk_sizes(config) -> tuple[int, ...]:
+    if getattr(config, "canonical_mv_conditions", False):
+        return (8, 4, 2, 1)
     if config.canonical_six_views:
         return (6, 2, 1)
     chunk_size = max(config.multi_view_chunk_size, 1)
@@ -452,23 +484,36 @@ def _render_multiview_chunk(
     output_dir: pathlib.Path,
     suffix: str,
     chunk_specs: list[tuple[int, str | None, float, float]],
-) -> tuple[list[tuple[pathlib.Path, object]], list[tuple[int, str | None, float, float, pathlib.Path]], float, float]:
+    render_modes: tuple[str, ...],
+) -> tuple[list[tuple[pathlib.Path, object]], list[tuple[int, str | None, float, float, str, pathlib.Path]], float, float]:
     prepared_rows = []
     rows = []
     prepare_views_ms = 0.0
     render_ms = 0.0
     for view_index, label, elev, azim in chunk_specs:
         view_config = replace(base_config, elev=elev, azim=azim)
-        output_path = _multi_view_output_path(output_dir, suffix, view_index, elev, azim, label=label)
         prepare_start = time.perf_counter()
         prepared = renderer.prepare_view(assets, config=view_config)
         prepare_views_ms += (time.perf_counter() - prepare_start) * 1000.0
-        prepared_rows.append((prepared, output_path))
-        rows.append((view_index, label, elev, azim, output_path))
+        prepared_rows.append((prepared, view_index, label, elev, azim))
     render_start = time.perf_counter()
-    images = [renderer.render_prepared(prepared) for prepared, _output_path in prepared_rows]
+    images = [renderer.render_prepared_modes(prepared, render_modes) for prepared, _view_index, _label, _elev, _azim in prepared_rows]
     render_ms += (time.perf_counter() - render_start) * 1000.0
-    outputs = [(output_path, image) for (_prepared, output_path), image in zip(prepared_rows, images)]
+    outputs: list[tuple[pathlib.Path, object]] = []
+    for (prepared, view_index, label, elev, azim), image_map in zip(prepared_rows, images):
+        del prepared
+        for mode in render_modes:
+            output_path = _multi_view_output_path(
+                output_dir,
+                suffix,
+                view_index,
+                elev,
+                azim,
+                label=label,
+                mode=mode if len(render_modes) > 1 else None,
+            )
+            outputs.append((output_path, image_map[mode]))
+            rows.append((view_index, label, elev, azim, mode, output_path))
     return outputs, rows, prepare_views_ms, render_ms
 
 
@@ -480,21 +525,23 @@ def _render_multiview_pass(
     output_dir: pathlib.Path,
     suffix: str,
     view_specs: list[tuple[int, str | None, float, float]],
+    render_modes: tuple[str, ...],
     chunk_sizes: tuple[int, ...],
     logger: RunLogger,
-) -> tuple[list[pathlib.Path], list[tuple[int, str | None, float, float, pathlib.Path]], list[int], int, float, float, float, float]:
+) -> tuple[list[pathlib.Path], list[tuple[int, str | None, float, float, str, pathlib.Path]], list[int], int, float, float, float, float]:
     rows = []
     outputs = []
     attempted_chunk_sizes = [chunk_sizes[0]]
     chunk_size_index = 0
     chunk_start = 0
     progress_start = time.perf_counter()
+    total_outputs = len(view_specs) * len(render_modes)
     session_init_ms = 0.0
     prepare_views_ms_total = 0.0
     render_ms_total = 0.0
     save_ms_total = 0.0
     saver = AsyncImageSaver(
-        max_pending=max(chunk_sizes[0], 2),
+        max_pending=max(chunk_sizes[0] * len(render_modes), 2),
         png_compression=base_config.png_compression,
     )
     try:
@@ -517,6 +564,7 @@ def _render_multiview_pass(
                     output_dir,
                     suffix,
                     chunk_specs,
+                    render_modes,
                 )
             except Exception as exc:
                 if is_cuda_oom(exc) and chunk_size_index + 1 < len(chunk_sizes):
@@ -549,14 +597,14 @@ def _render_multiview_pass(
             render_ms_total += chunk_render_ms
             elapsed_ms = (time.perf_counter() - progress_start) * 1000.0
             chunk_duration_ms = (time.perf_counter() - chunk_started) * 1000.0
-            eta_ms = estimate_remaining_ms(len(rows), len(view_specs), elapsed_ms)
+            eta_ms = estimate_remaining_ms(len(rows), total_outputs, elapsed_ms)
             logger.log(
-                f"Completed multi-view chunk {chunk_index}; saved {len(rows)}/{len(view_specs)} view(s)",
+                f"Completed multi-view chunk {chunk_index}; saved {len(rows)}/{total_outputs} output(s)",
                 console="always",
                 console_message=_progress_line(
                     "multi-view",
                     len(rows),
-                    len(view_specs),
+                    total_outputs,
                     item_label=f"chunk {chunk_index}",
                     last_ms=chunk_duration_ms,
                     eta_ms=eta_ms,
@@ -587,20 +635,21 @@ def _render_multiview_from_config(config) -> tuple[list[pathlib.Path], pathlib.P
     if config.render_all:
         raise ValueError("--render-all is not supported together with multi-view rendering")
     view_specs = _multi_view_specs(config)
+    render_modes = _multiview_render_modes(config)
     output_dir = _render_all_output_dir(config.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = RunLogger(_multi_view_log_path(output_dir), echo=config.print_progress)
     logger.reset()
-    total_views = len(view_specs)
+    total_outputs = len(view_specs) * len(render_modes)
     logger.log(
-        f"Starting multi-view run for {total_views} view(s) -> {output_dir}",
+        f"Starting multi-view run for {len(view_specs)} view(s) / {total_outputs} output(s) -> {output_dir}",
         console="always",
         console_message="[Info] Multi-View Start: Initializing",
     )
     logger.log(
-        f"Multi-view total views: {total_views}",
+        f"Multi-view total views: {len(view_specs)}; render modes per view: {', '.join(render_modes)}",
         console="always",
-        console_message=f"[Info] Multi-View Items: total={total_views}",
+        console_message=f"[Info] Multi-View Items: total={total_outputs}",
     )
     if config.display:
         logger.log("Ignoring --display during multi-view rendering.")
@@ -619,7 +668,11 @@ def _render_multiview_from_config(config) -> tuple[list[pathlib.Path], pathlib.P
         assets_start = time.perf_counter()
         assets = renderer.prepare_assets(pathlib.Path(config.input))
         data_loading_ms += (time.perf_counter() - assets_start) * 1000.0
-        if config.canonical_six_views:
+        if getattr(config, "canonical_mv_conditions", False):
+            logger.log(
+                "Using canonical twelve-view condition set with sequential chunk rendering and modes normal_ogl, position_ogl; initial chunk size 8."
+            )
+        elif config.canonical_six_views:
             logger.log("Using canonical six-view set with sequential chunk rendering and CUDA OOM fallback through chunk sizes 6, 2, 1.")
         else:
             logger.log(
@@ -643,6 +696,7 @@ def _render_multiview_from_config(config) -> tuple[list[pathlib.Path], pathlib.P
             output_dir,
             suffix,
             view_specs,
+            render_modes,
             chunk_sizes=chunk_sizes,
             logger=logger,
         )
@@ -701,7 +755,7 @@ def render_multi_view() -> tuple[list[pathlib.Path], pathlib.Path]:
         raise RuntimeError("CUDA is required for this renderer")
     config = config_from_args(args)
     if not _is_multi_view(config):
-        raise ValueError("Specify --canonical-six-views or provide at least one full multi-view range triplet")
+        raise ValueError("Specify --canonical-six-views, --canonical-mv-conditions, or provide at least one full multi-view range triplet")
     return _render_multiview_from_config(config)
 
 

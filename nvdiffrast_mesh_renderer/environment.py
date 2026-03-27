@@ -77,21 +77,24 @@ class EnvironmentService:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         res = config.resolution
         if env is not None and config.env_usage in {"background", "both"}:
-            coords = self.background_grid_cache.get_coords(res, device)
-            yv = coords.view(res, 1).expand(res, res)
-            xv = coords.view(1, res).expand(res, res)
-            tan_half = math.tan(math.radians(config.fov) * 0.5)
-            dirs_cam = safe_normalize(
-                torch.stack(
-                    [
-                        xv * tan_half,
-                        yv * tan_half,
-                        torch.full((res, res), -1.0, device=device, dtype=torch.float32),
-                    ],
-                    dim=-1,
+            if getattr(camera, "projection_type", "perspective") == "orthographic":
+                dirs_world = camera.forward.view(1, 1, 1, 3).expand(1, res, res, 3)
+            else:
+                coords = self.background_grid_cache.get_coords(res, device)
+                yv = coords.view(res, 1).expand(res, res)
+                xv = coords.view(1, res).expand(res, res)
+                tan_half = math.tan(math.radians(config.fov) * 0.5)
+                dirs_cam = safe_normalize(
+                    torch.stack(
+                        [
+                            xv * tan_half,
+                            yv * tan_half,
+                            torch.full((res, res), -1.0, device=device, dtype=torch.float32),
+                        ],
+                        dim=-1,
+                    )
                 )
-            )
-            dirs_world = torch.matmul(dirs_cam, camera.cam_to_world[:3, :3].t()).unsqueeze(0)
+                dirs_world = torch.matmul(dirs_cam, camera.cam_to_world[:3, :3].t()).unsqueeze(0)
             bg = sample_environment(env, dirs_world, intensity=env.background_intensity)
             return bg, torch.ones_like(bg[..., :1])
         if config.background_transparent:

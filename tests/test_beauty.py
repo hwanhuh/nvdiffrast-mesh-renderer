@@ -142,6 +142,21 @@ class OglRenderModeTests(unittest.TestCase):
         expected = torch.tensor([[[[1.0]]]], dtype=torch.float32)
         self.assertTrue(torch.allclose(result.value, expected))
 
+    def test_confidence_ogl_uses_constant_view_direction_for_orthographic_camera(self):
+        renderer = self._make_renderer()
+        normal_world = torch.tensor([[[[1.0, 0.0, 0.0]]]], dtype=torch.float32)
+        layer = self._make_layer(normal_world=normal_world, world_pos=torch.tensor([[[[0.0, 0.0, 5.0]]]], dtype=torch.float32))
+        camera = SimpleNamespace(
+            projection_type="orthographic",
+            forward=torch.tensor([-1.0, 0.0, 0.0], dtype=torch.float32),
+            position=torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32),
+        )
+
+        result = renderer.render_mode("confidence_ogl", layer, camera)
+
+        expected = torch.tensor([[[[1.0]]]], dtype=torch.float32)
+        self.assertTrue(torch.allclose(result.value, expected))
+
 
 if __name__ == "__main__":
     unittest.main()

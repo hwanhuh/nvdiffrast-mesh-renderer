@@ -38,6 +38,20 @@ def perspective(fov_y_deg: float, aspect: float, near: float, far: float) -> np.
     )
 
 
+def orthographic(half_extent_y: float, aspect: float, near: float, far: float) -> np.ndarray:
+    half_extent_y = max(float(half_extent_y), 1e-6)
+    half_extent_x = max(float(aspect) * half_extent_y, 1e-6)
+    return np.array(
+        [
+            [1.0 / half_extent_x, 0.0, 0.0, 0.0],
+            [0.0, 1.0 / half_extent_y, 0.0, 0.0],
+            [0.0, 0.0, -2.0 / (far - near), -(far + near) / (far - near)],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+
 def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     forward = safe_normalize_np(target - eye)
     up = safe_normalize_np(up.astype(np.float32))
@@ -62,10 +76,16 @@ def orbit_camera(
     fov_y_deg: float,
     distance_scale: float = 1.15,
     distance_override: Optional[float] = None,
+    projection_type: str = "perspective",
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     radius = max(float(radius), 1e-3)
     fov_half = math.radians(fov_y_deg) * 0.5
-    distance = distance_override if distance_override is not None else radius / math.sin(max(fov_half, 1e-3))
+    if distance_override is not None:
+        distance = float(distance_override)
+    elif projection_type == "orthographic":
+        distance = radius
+    else:
+        distance = radius / math.sin(max(fov_half, 1e-3))
     distance *= distance_scale
     elev = math.radians(elev_deg)
     azim = math.radians(azim_deg)

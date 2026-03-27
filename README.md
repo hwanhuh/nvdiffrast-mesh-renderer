@@ -144,6 +144,18 @@ nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff2
 
 This writes 24 images into the output directory: `normal_ogl` and `position_ogl` for each of 12 canonical views (`front/back/left/right/top/bottom` plus `front2/right2/back2/left2/top2/bottom2`). This mode uses a smaller initial chunk size of 8 views instead of trying all 12 at once.
 
+Canonical render_cond-inspired render:
+
+```bash
+nvdiffrast-mesh-render-multi-view example_meshes/c7fd79edb639400293683095caafff21_1024.glb \
+    --output outputs/canonical_render_cond \
+    --resolution 1024 \
+    --render-mode beauty \
+    --canonical-render-cond
+```
+
+This writes 16 render_cond-style views into the output directory. The preset uses mesh-seeded random offsets, FOV sampling, and view-seeded light randomness inspired by the original `render_cond.py`, rejects views above or below `|elev| > 60`, resamples to keep 16 outputs, and always starts with chunk size 8 before falling back to 4, 2, and 1 on CUDA OOM. Batch mode accepts the same flag and seeds the randomness from each row's `mesh_id`.
+
 Manifest-driven batch render:
 
 ```bash
@@ -203,6 +215,7 @@ Input / output:
 - `--render-all`
 - `--canonical-six-views`
 - `--canonical-mv-conditions`
+- `--canonical-render-cond`
 - `--multi-view-chunk-size`
 - `--print`
 
@@ -594,7 +607,7 @@ SceneRenderer(config).render_to_file()
 - `--render-all` remains a validation/inspection workflow rather than the multi-GPU batch path. Normal runs batch a few modes per shared geometry pass for speed, while benchmark runs still re-render once per mode for timing fidelity.
 - Multi-view rendering currently cannot be combined with `--render-all`.
 - `--display` is not meaningful for multi-view rendering because the view grid is emitted as files.
-- `--canonical-six-views` and `--canonical-mv-conditions` cannot be combined with explicit multi-view range flags such as `--azim-start` or `--elev-start`.
+- `--canonical-six-views`, `--canonical-mv-conditions`, and `--canonical-render-cond` cannot be combined with explicit multi-view range flags such as `--azim-start` or `--elev-start`.
 - There is no support for animation, skinning, morph targets, or multi-camera scenes.
 - Hidden-line and multi-layer rendering are not implemented yet, though the raster path is structured so `nvdiffrast` DepthPeeler can be introduced later.
 

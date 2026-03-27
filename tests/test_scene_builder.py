@@ -56,6 +56,23 @@ class SceneBuilderClipPlaneTests(unittest.TestCase):
         self.assertAlmostEqual(float(camera_near.proj[0, 0].item()), 1.0 / 3.0, places=6)
         self.assertAlmostEqual(float(camera_far.proj[0, 0].item()), 1.0 / 6.0, places=6)
 
+    def test_view_seeded_lights_are_deterministic(self):
+        lights_a = self.builder.build_view_seeded_lights(1.1, camera_direction=np.array([0.0, 0.0, 1.0], dtype=np.float32), view_seed=1234)
+        lights_b = self.builder.build_view_seeded_lights(1.1, camera_direction=np.array([0.0, 0.0, 1.0], dtype=np.float32), view_seed=1234)
+
+        self.assertEqual(len(lights_a), len(lights_b))
+        for (dir_a, color_a), (dir_b, color_b) in zip(lights_a, lights_b):
+            self.assertTrue(torch.allclose(dir_a, dir_b))
+            self.assertTrue(torch.allclose(color_a, color_b))
+
+    def test_view_seeded_lights_vary_with_seed(self):
+        lights_a = self.builder.build_view_seeded_lights(1.1, camera_direction=np.array([0.0, 0.0, 1.0], dtype=np.float32), view_seed=1234)
+        lights_b = self.builder.build_view_seeded_lights(1.1, camera_direction=np.array([0.0, 0.0, 1.0], dtype=np.float32), view_seed=5678)
+
+        serialized_a = [torch.cat([direction.reshape(-1), color.reshape(-1)]).tolist() for direction, color in lights_a]
+        serialized_b = [torch.cat([direction.reshape(-1), color.reshape(-1)]).tolist() for direction, color in lights_b]
+        self.assertNotEqual(serialized_a, serialized_b)
+
 
 if __name__ == "__main__":
     unittest.main()

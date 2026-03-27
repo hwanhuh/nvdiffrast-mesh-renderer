@@ -107,6 +107,7 @@ class RenderConfig:
     render_all_batch_size: int
     canonical_six_views: bool
     canonical_mv_conditions: bool
+    canonical_render_cond: bool
     multi_view_chunk_size: int
     geometry_preprocess_device: str
     geometry_cuda_threshold_faces: int
@@ -186,10 +187,17 @@ def _validate_multi_view_args(
     azim_end: Optional[float],
     azim_step: Optional[float],
 ) -> None:
-    if (bool(getattr(args, "canonical_six_views", False)) or bool(getattr(args, "canonical_mv_conditions", False))) and any(
+    canonical_flags = (
+        bool(getattr(args, "canonical_six_views", False)),
+        bool(getattr(args, "canonical_mv_conditions", False)),
+        bool(getattr(args, "canonical_render_cond", False)),
+    )
+    if sum(canonical_flags) > 1:
+        raise ValueError("--canonical-six-views, --canonical-mv-conditions, and --canonical-render-cond are mutually exclusive")
+    if any(canonical_flags) and any(
         value is not None for value in (elev_start, elev_end, elev_step, azim_start, azim_end, azim_step)
     ):
-        raise ValueError("--canonical-six-views/--canonical-mv-conditions cannot be combined with explicit multi-view range arguments")
+        raise ValueError("--canonical-six-views/--canonical-mv-conditions/--canonical-render-cond cannot be combined with explicit multi-view range arguments")
 
 
 def add_render_arguments(
@@ -199,6 +207,7 @@ def add_render_arguments(
     include_output: bool = True,
     include_view_ranges: bool = True,
     include_canonical_six_views: bool = True,
+    include_canonical_render_cond: bool = True,
     include_multi_view_chunk_size: bool = True,
     include_render_all: bool = True,
     include_benchmark: bool = True,
@@ -273,6 +282,12 @@ def add_render_arguments(
             "--canonical-mv-conditions",
             action="store_true",
             help="Render canonical six views for both normal_ogl and position_ogl conditions, producing 12 outputs.",
+        )
+    if include_canonical_render_cond:
+        parser.add_argument(
+            "--canonical-render-cond",
+            action="store_true",
+            help="Render a deterministic render_cond-style multi-view set with per-view FOV overrides and filtered top/bottom extremes.",
         )
     if include_multi_view_chunk_size:
         parser.add_argument("--multi-view-chunk-size", type=int, default=4, help="Maximum number of views to stage per sequential multi-view chunk")
@@ -371,6 +386,7 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         render_all_batch_size=max(int(getattr(args, "render_all_batch_size", 4)), 1),
         canonical_six_views=bool(getattr(args, "canonical_six_views", False)),
         canonical_mv_conditions=bool(getattr(args, "canonical_mv_conditions", False)),
+        canonical_render_cond=bool(getattr(args, "canonical_render_cond", False)),
         multi_view_chunk_size=max(int(getattr(args, "multi_view_chunk_size", 4)), 1),
         geometry_preprocess_device=str(getattr(args, "geometry_preprocess_device", "auto")),
         geometry_cuda_threshold_faces=max(int(getattr(args, "geometry_cuda_threshold_faces", 100000)), 0),

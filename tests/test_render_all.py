@@ -2,6 +2,7 @@ import pathlib
 import unittest
 from types import SimpleNamespace
 
+from nvdiffrast_mesh_renderer.batch import _build_global_view_source, build_argparser as build_batch_argparser
 from nvdiffrast_mesh_renderer.cli import (
     _is_multi_view,
     _multi_view_output_path,
@@ -12,6 +13,7 @@ from nvdiffrast_mesh_renderer.cli import (
 )
 from nvdiffrast_mesh_renderer.config import build_argparser, config_from_args
 from nvdiffrast_mesh_renderer.renderer import SceneRenderer
+from nvdiffrast_mesh_renderer.view_presets import CANONICAL_RENDER_COND_MAX_ABS_ELEV, CANONICAL_RENDER_COND_VIEW_COUNT
 
 
 class _FakeGeometry:
@@ -145,6 +147,12 @@ class RenderAllBatchConfigTests(unittest.TestCase):
 
         self.assertTrue(config.canonical_mv_conditions)
 
+    def test_config_parses_canonical_render_cond(self):
+        parser = build_argparser()
+        config = config_from_args(parser.parse_args(["example.glb", "--canonical-render-cond"]))
+
+        self.assertTrue(config.canonical_render_cond)
+
     def test_config_parses_texture_map_max_size(self):
         parser = build_argparser()
         args = parser.parse_args(["example.glb", "--texture-map-max-size", "2048"])
@@ -152,12 +160,37 @@ class RenderAllBatchConfigTests(unittest.TestCase):
 
         self.assertEqual(config.texture_map_max_size, 2048)
 
+    def test_batch_parser_accepts_canonical_render_cond(self):
+        parser = build_batch_argparser()
+        args = parser.parse_args(["--manifest", "manifest.jsonl", "--output-root", "outputs/batch", "--canonical-render-cond"])
+
+        source = _build_global_view_source(args)
+
+        self.assertIsNotNone(source)
+        self.assertEqual(source.kind, "canonical_render_cond")
+
 
 class MultiViewConfigTests(unittest.TestCase):
     def test_canonical_mv_conditions_trigger_multiview(self):
         config = SimpleNamespace(
             canonical_six_views=False,
             canonical_mv_conditions=True,
+            canonical_render_cond=False,
+            azim_start=None,
+            azim_end=None,
+            azim_step=None,
+            elev_start=None,
+            elev_end=None,
+            elev_step=None,
+        )
+
+        self.assertTrue(_is_multi_view(config))
+
+    def test_canonical_render_cond_triggers_multiview(self):
+        config = SimpleNamespace(
+            canonical_six_views=False,
+            canonical_mv_conditions=False,
+            canonical_render_cond=True,
             azim_start=None,
             azim_end=None,
             azim_step=None,
@@ -172,6 +205,7 @@ class MultiViewConfigTests(unittest.TestCase):
         config = SimpleNamespace(
             canonical_six_views=False,
             canonical_mv_conditions=True,
+            canonical_render_cond=False,
             elev=0.0,
             azim=0.0,
             elev_start=None,
@@ -185,9 +219,85 @@ class MultiViewConfigTests(unittest.TestCase):
         specs = _multi_view_specs(config)
 
         self.assertEqual(len(specs), 12)
-        self.assertEqual(specs[0][1], "front")
-        self.assertEqual(specs[6][1], "front2")
-        self.assertEqual(specs[-1][1], "bottom2")
+        self.assertEqual(specs[0].label, "front")
+        self.assertEqual(specs[6].label, "front2")
+        self.assertEqual(specs[-1].label, "bottom2")
+
+    def test_canonical_render_cond_specs_filter_extreme_elevations(self):
+        config = SimpleNamespace(
+            canonical_six_views=False,
+            canonical_mv_conditions=False,
+            canonical_render_cond=True,
+            input="mesh_a.glb",
+            elev=0.0,
+            azim=0.0,
+            elev_start=None,
+            elev_end=None,
+            elev_step=None,
+            azim_start=None,
+            azim_end=None,
+            azim_step=None,
+        )
+
+        specs = _multi_view_specs(config)
+
+        self.assertEqual(len(specs), CANONICAL_RENDER_COND_VIEW_COUNT)
+        self.assertTrue(all(abs(spec.elev) <= CANONICAL_RENDER_COND_MAX_ABS_ELEV for spec in specs))
+        self.assertTrue(all(spec.fov is not None for spec in specs))
+        self.assertTrue(all(spec.distance_scale == 1.0 for spec in specs))
+        self.assertTrue(all(spec.light_seed is not None for spec in specs))
+        self.assertEqual(specs[0].label, "render_cond_00")
+
+    def test_canonical_render_cond_specs_are_deterministic_per_asset(self):
+        config = SimpleNamespace(
+            canonical_six_views=False,
+            canonical_mv_conditions=False,
+            canonical_render_cond=True,
+            input="mesh_a.glb",
+            elev=0.0,
+            azim=0.0,
+            elev_start=None,
+            elev_end=None,
+            elev_step=None,
+            azim_start=None,
+            azim_end=None,
+            azim_step=None,
+        )
+
+        specs_a = _multi_view_specs(config)
+        specs_b = _multi_view_specs(config)
+
+        self.assertEqual(
+            [(spec.elev, spec.azim, spec.fov) for spec in specs_a],
+            [(spec.elev, spec.azim, spec.fov) for spec in specs_b],
+        )
+
+    def test_canonical_render_cond_specs_vary_across_assets(self):
+        base = dict(
+            canonical_six_views=False,
+            canonical_mv_conditions=False,
+            canonical_render_cond=True,
+            elev=0.0,
+            azim=0.0,
+            elev_start=None,
+            elev_end=None,
+            elev_step=None,
+            azim_start=None,
+            azim_end=None,
+            azim_step=None,
+        )
+
+        specs_a = _multi_view_specs(SimpleNamespace(input="mesh_a.glb", **base))
+        specs_b = _multi_view_specs(SimpleNamespace(input="mesh_b.glb", **base))
+
+        self.assertNotEqual(
+            [(spec.elev, spec.azim, spec.fov) for spec in specs_a],
+            [(spec.elev, spec.azim, spec.fov) for spec in specs_b],
+        )
+        self.assertNotEqual(
+            [spec.light_seed for spec in specs_a],
+            [spec.light_seed for spec in specs_b],
+        )
 
     def test_canonical_mv_conditions_use_normal_and_position_modes(self):
         config = SimpleNamespace(canonical_mv_conditions=True, render_mode="beauty")
@@ -195,7 +305,12 @@ class MultiViewConfigTests(unittest.TestCase):
         self.assertEqual(_multiview_render_modes(config), ("normal_ogl", "position_ogl"))
 
     def test_canonical_mv_conditions_use_chunk_size_eight_fallbacks(self):
-        config = SimpleNamespace(canonical_mv_conditions=True, canonical_six_views=False, multi_view_chunk_size=24)
+        config = SimpleNamespace(canonical_mv_conditions=True, canonical_render_cond=False, canonical_six_views=False, multi_view_chunk_size=24)
+
+        self.assertEqual(_multiview_chunk_sizes(config), (8, 4, 2, 1))
+
+    def test_canonical_render_cond_uses_chunk_size_eight_fallbacks(self):
+        config = SimpleNamespace(canonical_mv_conditions=False, canonical_render_cond=True, canonical_six_views=False, multi_view_chunk_size=24)
 
         self.assertEqual(_multiview_chunk_sizes(config), (8, 4, 2, 1))
 

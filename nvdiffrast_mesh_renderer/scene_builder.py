@@ -1,4 +1,6 @@
 import pathlib
+import math
+import random
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
@@ -156,6 +158,46 @@ class SceneBuilder:
             direction_world = safe_normalize(torch.tensor(direction, device=self.device, dtype=torch.float32))
             light_color = torch.tensor(color, device=self.device, dtype=torch.float32)
             lights.append((direction_world.view(1, 1, 1, 3), light_color.view(1, 1, 1, 3) * strength))
+        return lights
+
+    def build_view_seeded_lights(
+        self,
+        strength: float,
+        *,
+        camera_direction: np.ndarray,
+        view_seed: int,
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        rng = random.Random(int(view_seed))
+        camera_dir = safe_normalize_np(np.asarray(camera_direction, dtype=np.float32).reshape(3))
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        if abs(float(np.dot(camera_dir, world_up))) > 0.95:
+            world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        tangent = safe_normalize_np(np.cross(world_up, camera_dir))
+        bitangent = safe_normalize_np(np.cross(camera_dir, tangent))
+        remaining_strength = max(float(strength), 1e-3) * 1.5
+        lights = []
+        for _index in range(rng.randint(1, 3)):
+            light_dir = safe_normalize_np(
+                (camera_dir * rng.uniform(0.35, 1.0))
+                + (tangent * rng.uniform(-1.0, 1.0))
+                + (bitangent * rng.uniform(-0.75, 0.75))
+                + (world_up * rng.uniform(-0.15, 0.35))
+            )
+            camera_ratio = max(float(np.dot(camera_dir, light_dir)) * 0.5 + 0.5, 0.0)
+            max_energy = remaining_strength / max(float(np.dot(camera_dir, light_dir)) * 0.45 + 0.55, 0.1)
+            light_strength = math.sqrt(rng.uniform(0.01, 1.0)) * max_energy
+            remaining_strength = max(remaining_strength - (camera_ratio * light_strength), max(float(strength) * 0.15, 0.05))
+            color = np.array(
+                [
+                    rng.uniform(0.94, 1.06),
+                    rng.uniform(0.94, 1.06),
+                    rng.uniform(0.94, 1.06),
+                ],
+                dtype=np.float32,
+            ) * light_strength
+            direction_world = safe_normalize(torch.tensor(light_dir, device=self.device, dtype=torch.float32))
+            light_color = torch.tensor(color, device=self.device, dtype=torch.float32)
+            lights.append((direction_world.view(1, 1, 1, 3), light_color.view(1, 1, 1, 3)))
         return lights
 
     def _iter_scene_meshes(self, scene: trimesh.Scene):

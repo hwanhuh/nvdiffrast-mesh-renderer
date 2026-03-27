@@ -23,6 +23,7 @@ from .lifecycle import RendererCache, is_cuda_failure, is_cuda_oom
 from .logging_utils import RunLogger, estimate_remaining_ms, format_duration_ms, format_path_notice
 from .renderer import SceneRenderer
 from .scene_builder import PreloadedSceneAsset, preload_scene_asset
+from .view_presets import generate_canonical_render_cond_views
 
 CANONICAL_SIX_VIEW_SPECS = (
     ("front", 0.0, 0.0),
@@ -70,6 +71,7 @@ class ViewSpec:
     distance: float | None = None
     distance_scale: float | None = None
     fov: float | None = None
+    light_seed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -417,6 +419,7 @@ def _parse_view_object(value: Any, *, name_override: str | None = None) -> dict[
         "distance": None if value.get("distance") is None else float(value["distance"]),
         "distance_scale": None if value.get("distance_scale") is None else float(value["distance_scale"]),
         "fov": None if value.get("fov") is None else float(value["fov"]),
+        "light_seed": None if value.get("light_seed") is None else int(value["light_seed"]),
     }
 
 
@@ -507,8 +510,13 @@ def _build_global_view_source(args: argparse.Namespace) -> GlobalViewSource | No
         sources.append(GlobalViewSource(kind="range", value=None))
     if getattr(args, "canonical_six_views", False):
         sources.append(GlobalViewSource(kind="canonical_six", value="canonical_six"))
+    if getattr(args, "canonical_render_cond", False):
+        sources.append(GlobalViewSource(kind="canonical_render_cond", value="canonical_render_cond"))
     if len(sources) > 1:
-        raise ValueError("Specify exactly one global view source among --views-json, --views-file, --view-preset, range flags, or --canonical-six-views")
+        raise ValueError(
+            "Specify exactly one global view source among --views-json, --views-file, --view-preset, range flags, "
+            "--canonical-six-views, or --canonical-render-cond"
+        )
     return sources[0] if sources else None
 
 
@@ -540,6 +548,7 @@ def _finalize_view_specs(raw_views: list[dict[str, Any]], *, default_name_templa
                 distance=None if raw_view.get("distance") is None else float(raw_view["distance"]),
                 distance_scale=None if raw_view.get("distance_scale") is None else float(raw_view["distance_scale"]),
                 fov=None if raw_view.get("fov") is None else float(raw_view["fov"]),
+                light_seed=None if raw_view.get("light_seed") is None else int(raw_view["light_seed"]),
             )
         )
     return tuple(finalized)
@@ -578,6 +587,9 @@ def _resolve_job_views(row: ManifestRow, global_source: GlobalViewSource | None,
     if global_source.kind == "canonical_six":
         raw_views, source_template = _parse_preset_views("canonical_six")
         return _finalize_view_specs(raw_views, default_name_template=default_name_template, source_name_template=source_template)
+    if global_source.kind == "canonical_render_cond":
+        raw_views = generate_canonical_render_cond_views(row.mesh_id)
+        return _finalize_view_specs(raw_views, default_name_template=default_name_template, source_name_template=None)
     elevs = _axis_values(config.elev_start, config.elev_end, config.elev_step, config.elev)
     azims = _axis_values(config.azim_start, config.azim_end, config.azim_step, config.azim)
     raw_views = [{"name": None, "elev": elev, "azim": azim, "distance": None, "distance_scale": None, "fov": None} for elev in elevs for azim in azims]
@@ -773,7 +785,7 @@ def _run_render_attempt(job: JobSpec, renderer: SceneRenderer, assets: Any, chun
             for view in chunk_views:
                 view_config = _view_config_for_job(job, view)
                 start = time.perf_counter()
-                prepared = renderer.prepare_view(assets, config=view_config)
+                prepared = renderer.prepare_view(assets, config=view_config, light_seed=view.light_seed)
                 prepare_views_ms += (time.perf_counter() - start) * 1000.0
                 image_name = f"{view.index:04d}_{view.name}{image_suffix}"
                 prepared_rows.append((view, view_config, prepared, image_name))
@@ -1441,6 +1453,7 @@ def build_argparser() -> argparse.ArgumentParser:
         include_output=False,
         include_view_ranges=True,
         include_canonical_six_views=True,
+        include_canonical_render_cond=True,
         include_multi_view_chunk_size=False,
         include_render_all=True,
         include_benchmark=False,

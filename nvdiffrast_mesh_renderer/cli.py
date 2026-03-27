@@ -11,6 +11,11 @@ from .image_io import AsyncImageSaver
 from .lifecycle import RendererCache, is_cuda_failure, is_cuda_oom
 from .logging_utils import RunLogger, estimate_remaining_ms, format_duration_ms, format_path_notice
 from .renderer import SceneRenderer
+from .view_presets import (
+    CANONICAL_RENDER_COND_MAX_ABS_ELEV,
+    CANONICAL_RENDER_COND_VIEW_COUNT,
+    generate_canonical_render_cond_views,
+)
 
 CANONICAL_SIX_VIEW_SPECS = (
     ("front", 0.0, 0.0),
@@ -78,6 +83,18 @@ class TimingBreakdown:
     scene_prepare_ms: float = 0.0
     render_ms: float = 0.0
     save_ms: float = 0.0
+
+
+@dataclass(frozen=True)
+class MultiViewSpec:
+    index: int
+    label: str | None
+    elev: float
+    azim: float
+    distance: float | None = None
+    distance_scale: float | None = None
+    fov: float | None = None
+    light_seed: int | None = None
 
 
 def _timing_summary_fields(timing: TimingBreakdown) -> list[tuple[str, float]]:
@@ -161,9 +178,14 @@ def _render_all_mode_batch_sizes(config, total_modes: int) -> tuple[int, ...]:
 
 
 def _is_multi_view(config) -> bool:
-    return config.canonical_six_views or getattr(config, "canonical_mv_conditions", False) or any(
+    return (
+        config.canonical_six_views
+        or getattr(config, "canonical_mv_conditions", False)
+        or getattr(config, "canonical_render_cond", False)
+        or any(
         getattr(config, name) is not None
         for name in ("azim_start", "azim_end", "azim_step", "elev_start", "elev_end", "elev_step")
+        )
     )
 
 
@@ -192,13 +214,31 @@ def _multi_view_pairs(config) -> list[tuple[float, float]]:
     return [(elev, azim) for elev in elevs for azim in azims]
 
 
-def _multi_view_specs(config) -> list[tuple[int, str | None, float, float]]:
+def _canonical_render_cond_specs(seed_key: str) -> list[MultiViewSpec]:
+    return [
+        MultiViewSpec(
+            index=index,
+            label=str(view["name"]),
+            elev=float(view["elev"]),
+            azim=float(view["azim"]),
+            distance=None if view.get("distance") is None else float(view["distance"]),
+            distance_scale=None if view.get("distance_scale") is None else float(view["distance_scale"]),
+            fov=None if view.get("fov") is None else float(view["fov"]),
+            light_seed=None if view.get("light_seed") is None else int(view["light_seed"]),
+        )
+        for index, view in enumerate(generate_canonical_render_cond_views(seed_key))
+    ]
+
+
+def _multi_view_specs(config) -> list[MultiViewSpec]:
     if getattr(config, "canonical_mv_conditions", False):
         combined_specs = CANONICAL_SIX_VIEW_SPECS + CANONICAL_OFFSET45_VIEW_SPECS
-        return [(index, label, elev, azim) for index, (label, elev, azim) in enumerate(combined_specs)]
+        return [MultiViewSpec(index=index, label=label, elev=elev, azim=azim) for index, (label, elev, azim) in enumerate(combined_specs)]
+    if getattr(config, "canonical_render_cond", False):
+        return _canonical_render_cond_specs(str(getattr(config, "input", "")))
     if config.canonical_six_views:
-        return [(index, label, elev, azim) for index, (label, elev, azim) in enumerate(CANONICAL_SIX_VIEW_SPECS)]
-    return [(index, None, elev, azim) for index, (elev, azim) in enumerate(_multi_view_pairs(config))]
+        return [MultiViewSpec(index=index, label=label, elev=elev, azim=azim) for index, (label, elev, azim) in enumerate(CANONICAL_SIX_VIEW_SPECS)]
+    return [MultiViewSpec(index=index, label=None, elev=elev, azim=azim) for index, (elev, azim) in enumerate(_multi_view_pairs(config))]
 
 
 def _format_angle(value: float) -> str:
@@ -464,10 +504,24 @@ def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
 def _multiview_chunk_sizes(config) -> tuple[int, ...]:
     if getattr(config, "canonical_mv_conditions", False):
         return (8, 4, 2, 1)
+    if getattr(config, "canonical_render_cond", False):
+        return (8, 4, 2, 1)
     if config.canonical_six_views:
         return (6, 2, 1)
     chunk_size = max(config.multi_view_chunk_size, 1)
     return tuple(range(chunk_size, 0, -1))
+
+
+def _view_config_for_spec(base_config, spec: MultiViewSpec):
+    use_spec_camera = spec.distance is not None or spec.distance_scale is not None or spec.fov is not None
+    return replace(
+        base_config,
+        elev=spec.elev,
+        azim=spec.azim,
+        distance=spec.distance if use_spec_camera else base_config.distance,
+        distance_scale=base_config.distance_scale if spec.distance_scale is None else spec.distance_scale,
+        fov=base_config.fov if spec.fov is None else spec.fov,
+    )
 
 
 def _format_chunk_size_info(chunk_sizes_attempted: list[int], chunk_size_used: int) -> str:
@@ -483,37 +537,37 @@ def _render_multiview_chunk(
     base_config,
     output_dir: pathlib.Path,
     suffix: str,
-    chunk_specs: list[tuple[int, str | None, float, float]],
+    chunk_specs: list[MultiViewSpec],
     render_modes: tuple[str, ...],
 ) -> tuple[list[tuple[pathlib.Path, object]], list[tuple[int, str | None, float, float, str, pathlib.Path]], float, float]:
     prepared_rows = []
     rows = []
     prepare_views_ms = 0.0
     render_ms = 0.0
-    for view_index, label, elev, azim in chunk_specs:
-        view_config = replace(base_config, elev=elev, azim=azim)
+    for spec in chunk_specs:
+        view_config = _view_config_for_spec(base_config, spec)
         prepare_start = time.perf_counter()
-        prepared = renderer.prepare_view(assets, config=view_config)
+        prepared = renderer.prepare_view(assets, config=view_config, light_seed=spec.light_seed)
         prepare_views_ms += (time.perf_counter() - prepare_start) * 1000.0
-        prepared_rows.append((prepared, view_index, label, elev, azim))
+        prepared_rows.append((prepared, spec))
     render_start = time.perf_counter()
-    images = [renderer.render_prepared_modes(prepared, render_modes) for prepared, _view_index, _label, _elev, _azim in prepared_rows]
+    images = [renderer.render_prepared_modes(prepared, render_modes) for prepared, _spec in prepared_rows]
     render_ms += (time.perf_counter() - render_start) * 1000.0
     outputs: list[tuple[pathlib.Path, object]] = []
-    for (prepared, view_index, label, elev, azim), image_map in zip(prepared_rows, images):
+    for (prepared, spec), image_map in zip(prepared_rows, images):
         del prepared
         for mode in render_modes:
             output_path = _multi_view_output_path(
                 output_dir,
                 suffix,
-                view_index,
-                elev,
-                azim,
-                label=label,
+                spec.index,
+                spec.elev,
+                spec.azim,
+                label=spec.label,
                 mode=mode if len(render_modes) > 1 else None,
             )
             outputs.append((output_path, image_map[mode]))
-            rows.append((view_index, label, elev, azim, mode, output_path))
+            rows.append((spec.index, spec.label, spec.elev, spec.azim, mode, output_path))
     return outputs, rows, prepare_views_ms, render_ms
 
 
@@ -524,7 +578,7 @@ def _render_multiview_pass(
     base_config,
     output_dir: pathlib.Path,
     suffix: str,
-    view_specs: list[tuple[int, str | None, float, float]],
+    view_specs: list[MultiViewSpec],
     render_modes: tuple[str, ...],
     chunk_sizes: tuple[int, ...],
     logger: RunLogger,
@@ -672,6 +726,12 @@ def _render_multiview_from_config(config) -> tuple[list[pathlib.Path], pathlib.P
             logger.log(
                 "Using canonical twelve-view condition set with sequential chunk rendering and modes normal_ogl, position_ogl; initial chunk size 8."
             )
+        elif getattr(config, "canonical_render_cond", False):
+            logger.log(
+                "Using canonical render_cond set with "
+                f"{len(view_specs)}/{CANONICAL_RENDER_COND_VIEW_COUNT} filtered views, asset-seeded offsets/FOVs, "
+                f"max |elev| {CANONICAL_RENDER_COND_MAX_ABS_ELEV:.0f}, and fixed chunk size 8."
+            )
         elif config.canonical_six_views:
             logger.log("Using canonical six-view set with sequential chunk rendering and CUDA OOM fallback through chunk sizes 6, 2, 1.")
         else:
@@ -755,7 +815,7 @@ def render_multi_view() -> tuple[list[pathlib.Path], pathlib.Path]:
         raise RuntimeError("CUDA is required for this renderer")
     config = config_from_args(args)
     if not _is_multi_view(config):
-        raise ValueError("Specify --canonical-six-views, --canonical-mv-conditions, or provide at least one full multi-view range triplet")
+        raise ValueError("Specify --canonical-six-views, --canonical-mv-conditions, --canonical-render-cond, or provide at least one full multi-view range triplet")
     return _render_multiview_from_config(config)
 
 

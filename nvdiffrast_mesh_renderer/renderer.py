@@ -103,14 +103,19 @@ class SceneRenderer:
         ibl = ImageBasedLighting(env, self.config.env_diffuse_samples, self.device) if env is not None else None
         return PreparedAssets(meshes=meshes, lights=lights, env=env, ibl=ibl, center=center, radius=radius)
 
-    def prepare_view(self, assets: PreparedAssets, config: RenderConfig | None = None) -> PreparedScene:
+    def prepare_view(self, assets: PreparedAssets, config: RenderConfig | None = None, light_seed: int | None = None) -> PreparedScene:
         current_config = self.config if config is None else config
         camera = self.scene_builder.build_camera(assets.meshes, current_config)
+        lights = assets.lights if light_seed is None else self.scene_builder.build_view_seeded_lights(
+            current_config.light_intensity,
+            camera_direction=(-camera.forward).detach().cpu().numpy(),
+            view_seed=light_seed,
+        )
         bg_rgb, bg_alpha = self.environment.render_background(camera, current_config, assets.env, self.device)
         return PreparedScene(
             meshes=assets.meshes,
             camera=camera,
-            lights=assets.lights,
+            lights=lights,
             ibl=assets.ibl,
             bg_rgb=bg_rgb,
             bg_alpha=bg_alpha,

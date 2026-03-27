@@ -280,6 +280,29 @@ PAGE_HTML = """<!doctype html>
       accent-color: var(--accent);
     }
 
+    .color-row {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 12px;
+      align-items: center;
+    }
+
+    input[type="color"] {
+      width: 56px;
+      height: 40px;
+      padding: 4px;
+      border: 1px solid rgba(31, 41, 51, 0.16);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.92);
+      cursor: pointer;
+    }
+
+    .color-value {
+      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
     .preview-shell {
       position: relative;
       min-height: 620px;
@@ -501,6 +524,14 @@ PAGE_HTML = """<!doctype html>
             </div>
           </label>
 
+          <label class="slider-block">
+            JPEG Background
+            <div class="color-row">
+              <input id="backgroundColorInput" type="color" value="#ffffff">
+              <span class="color-value" id="backgroundColorValue">#ffffff</span>
+            </div>
+          </label>
+
           <div class="toolbar">
             <button class="button secondary" id="resetButton" type="button">Reset View</button>
             <button class="button secondary" id="renderButton" type="button">Render Now</button>
@@ -532,7 +563,7 @@ PAGE_HTML = """<!doctype html>
 
   <script>
     window.__VIEWER_STATE__ = __INITIAL_VIEWER_STATE__;
-    const defaults = { elev: 15, azim: 35, distance: 1.15, fov: 45, mode: "beauty" };
+    const defaults = { elev: 15, azim: 35, distance: 1.15, fov: 45, mode: "beauty", background: "#ffffff" };
     const apiBase = new URL(".", window.location.href);
     const state = {
       meshId: null,
@@ -556,10 +587,12 @@ PAGE_HTML = """<!doctype html>
     const azimInput = document.getElementById("azimInput");
     const distanceInput = document.getElementById("distanceInput");
     const fovInput = document.getElementById("fovInput");
+    const backgroundColorInput = document.getElementById("backgroundColorInput");
     const elevValue = document.getElementById("elevValue");
     const azimValue = document.getElementById("azimValue");
     const distanceValue = document.getElementById("distanceValue");
     const fovValue = document.getElementById("fovValue");
+    const backgroundColorValue = document.getElementById("backgroundColorValue");
     const resetButton = document.getElementById("resetButton");
     const renderButton = document.getElementById("renderButton");
     const previewShell = document.getElementById("previewShell");
@@ -596,7 +629,15 @@ PAGE_HTML = """<!doctype html>
       azimValue.textContent = `${Number(azimInput.value).toFixed(1)}°`;
       distanceValue.textContent = `${Number(distanceInput.value).toFixed(2)}x`;
       fovValue.textContent = `${Number(fovInput.value).toFixed(1)}°`;
+      backgroundColorValue.textContent = backgroundColorInput.value.toLowerCase();
       modeLabel.textContent = state.mode;
+    }
+
+    function applyBackgroundColor(value) {
+      const normalized = String(value || defaults.background).toLowerCase();
+      backgroundColorInput.value = normalized;
+      previewShell.style.background = normalized;
+      syncLabels();
     }
 
     function currentPayload() {
@@ -607,6 +648,7 @@ PAGE_HTML = """<!doctype html>
         azim: Number(azimInput.value),
         distance_scale: Number(distanceInput.value),
         fov: Number(fovInput.value),
+        background_hex: backgroundColorInput.value,
       };
     }
 
@@ -804,6 +846,7 @@ PAGE_HTML = """<!doctype html>
       updateSliderValue(azimInput, defaults.azim);
       updateSliderValue(distanceInput, defaults.distance);
       updateSliderValue(fovInput, defaults.fov);
+      applyBackgroundColor(defaults.background);
       queueFinalRender(0);
     }
 
@@ -824,6 +867,10 @@ PAGE_HTML = """<!doctype html>
     azimInput.addEventListener("input", onControlInput);
     distanceInput.addEventListener("input", onControlInput);
     fovInput.addEventListener("input", onControlInput);
+    backgroundColorInput.addEventListener("input", () => {
+      applyBackgroundColor(backgroundColorInput.value);
+      queueFinalRender(0);
+    });
 
     previewShell.addEventListener("pointerdown", (event) => {
       previewShell.classList.add("dragging");
@@ -876,10 +923,12 @@ PAGE_HTML = """<!doctype html>
         defaults.distance = payload.defaults.distance_scale;
         defaults.fov = payload.defaults.fov;
         defaults.mode = payload.defaults.render_mode;
+        defaults.background = payload.defaults.background_hex || "#ffffff";
         updateSliderValue(elevInput, defaults.elev);
         updateSliderValue(azimInput, defaults.azim);
         updateSliderValue(distanceInput, defaults.distance);
         updateSliderValue(fovInput, defaults.fov);
+        applyBackgroundColor(defaults.background);
         state.mode = defaults.mode;
         buildModeButtons(payload.render_modes);
         setMeshes(payload.meshes, payload.defaults.mesh_id);
@@ -900,6 +949,19 @@ PAGE_HTML = """<!doctype html>
 
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 SUPPORTED_UPLOAD_SUFFIXES = {".glb", ".gltf"}
+DEFAULT_BACKGROUND_HEX = "#ffffff"
+VIEWER_JPG_QUALITY = 90
+
+
+def _parse_background_hex(value: str | None) -> tuple[str, tuple[int, int, int]]:
+    text = (value or DEFAULT_BACKGROUND_HEX).strip().lower()
+    if len(text) != 7 or not text.startswith("#"):
+        raise ValueError("background_hex must be a #RRGGBB color.")
+    try:
+        rgb = tuple(int(text[index:index + 2], 16) for index in (1, 3, 5))
+    except ValueError as exc:
+        raise ValueError("background_hex must be a #RRGGBB color.") from exc
+    return text, rgb
 
 
 @dataclass(frozen=True)
@@ -970,6 +1032,7 @@ class ViewerBackend:
             "distance_scale": 1.15,
             "fov": 45.0,
             "render_mode": "beauty",
+            "background_hex": DEFAULT_BACKGROUND_HEX,
         }
         self._load_example_meshes()
         self.default_mesh_id = self._pick_default_mesh_id()
@@ -1029,9 +1092,8 @@ class ViewerBackend:
             tonemap="aces",
             cull_mode="auto",
             render_mode=self.defaults["render_mode"],
-            wireframe_color="0.95,0.48,0.16",
-            wireframe_opacity=1.0,
-            wireframe_thickness_px=0.65,
+            wireframe_opacity=0.7,
+            wireframe_thickness_px=0.45,
             double_sided_depth_peels=4,
             normalize_depth=True,
             render_all=False,
@@ -1134,7 +1196,7 @@ class ViewerBackend:
         self._meshes[mesh_id] = entry
         return entry
 
-    def render_png(
+    def render_image(
         self,
         *,
         mesh_id: str,
@@ -1143,14 +1205,16 @@ class ViewerBackend:
         azim: float,
         distance_scale: float,
         fov: float,
+        background_hex: str = DEFAULT_BACKGROUND_HEX,
         preview: bool = False,
-    ) -> tuple[bytes, float, int]:
+    ) -> tuple[bytes, str, float, int]:
         if render_mode not in self.render_modes:
             raise ValueError(f"Unsupported render mode: {render_mode}")
         if not (0.5 <= distance_scale <= 4.0):
             raise ValueError("distance_scale must stay between 0.5 and 4.0.")
         if not (10.0 <= fov <= 100.0):
             raise ValueError("fov must stay between 10 and 100 degrees.")
+        _, background_rgb = _parse_background_hex(background_hex)
         resolution = self.preview_resolution if preview else self.resolution
         started = time.perf_counter()
         with self._lock:
@@ -1187,12 +1251,21 @@ class ViewerBackend:
                 prepared = renderer_state.renderer.prepare_view(assets, effective_config)
                 image = renderer_state.renderer.render_prepared(prepared, render_mode=render_mode)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        return self._image_to_png(image), elapsed_ms, resolution
+        image_bytes, content_type = self._encode_response_image(
+            image,
+            background_rgb=background_rgb,
+        )
+        return image_bytes, content_type, elapsed_ms, resolution
 
-    def _image_to_png(self, image) -> bytes:
-        from nvdiffrast_mesh_renderer.image_io import encode_png_bytes
+    def _encode_response_image(
+        self,
+        image,
+        *,
+        background_rgb: tuple[int, int, int],
+    ) -> tuple[bytes, str]:
+        from nvdiffrast_mesh_renderer.image_io import encode_jpg_bytes
 
-        return encode_png_bytes(image, png_compression=1)
+        return encode_jpg_bytes(image, jpg_quality=VIEWER_JPG_QUALITY, background_rgb=background_rgb), "image/jpeg"
 
     def close(self) -> None:
         for renderer_state in self._renderer_states.values():
@@ -1273,13 +1346,14 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
     def _handle_render(self) -> None:
         try:
             payload = self._read_json()
-            image_bytes, elapsed_ms, resolution = self.server.backend.render_png(
+            image_bytes, content_type, elapsed_ms, resolution = self.server.backend.render_image(
                 mesh_id=str(payload["mesh_id"]),
                 render_mode=str(payload["render_mode"]),
                 elev=float(payload["elev"]),
                 azim=float(payload["azim"]),
                 distance_scale=float(payload["distance_scale"]),
                 fov=float(payload["fov"]),
+                background_hex=str(payload.get("background_hex", DEFAULT_BACKGROUND_HEX)),
                 preview=bool(payload.get("preview", False)),
             )
         except KeyError as exc:
@@ -1293,7 +1367,7 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
             return
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(image_bytes)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Render-Time-Ms", f"{elapsed_ms:.3f}")
@@ -1345,7 +1419,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1", help="Host/interface to bind")
     parser.add_argument("--port", type=int, default=8765, help="Port to listen on")
     parser.add_argument("--resolution", type=int, default=1024, help="Square render resolution")
-    parser.add_argument("--preview-resolution", type=int, default=192, help="Low-res preview size used while camera controls are moving")
+    parser.add_argument("--preview-resolution", type=int, default=128, help="Low-res preview size used while camera controls are moving")
     parser.add_argument("--example-dir", default="example_meshes", help="Directory containing bundled example meshes")
     parser.add_argument("--env-map", default="", help="Optional HDR/EXR environment map path. Disabled by default for compatibility.")
     parser.add_argument(

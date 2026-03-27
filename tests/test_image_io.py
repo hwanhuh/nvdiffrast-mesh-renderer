@@ -2,11 +2,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 
 from nvdiffrast_mesh_renderer.config import build_argparser, config_from_args
-from nvdiffrast_mesh_renderer.image_io import HostImage, encode_png_bytes, save_image
+from nvdiffrast_mesh_renderer.image_io import HostImage, encode_jpg_bytes, encode_png_bytes, save_image
 from nvdiffrast_mesh_renderer.postprocess import ImagePostprocessor
 
 
@@ -41,6 +42,20 @@ class ImageIoTests(unittest.TestCase):
             self.assertTrue(png_path.is_file())
             self.assertTrue(jpg_path.is_file())
             self.assertTrue(payload.startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_encode_jpg_bytes_accepts_rgba_host_image(self):
+        tensor = torch.tensor([[[255, 64, 32, 128]]], dtype=torch.uint8)
+        image = HostImage(tensor=tensor)
+
+        payload = encode_jpg_bytes(image, jpg_quality=85, background_rgb=(255, 255, 255))
+
+        self.assertTrue(payload.startswith(b"\xff\xd8\xff"))
+        decoded = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertIsNotNone(decoded)
+        rgb = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)[0, 0]
+        self.assertGreaterEqual(int(rgb[0]), 200)
+        self.assertGreaterEqual(int(rgb[1]), 140)
+        self.assertGreaterEqual(int(rgb[2]), 120)
 
 
 if __name__ == "__main__":

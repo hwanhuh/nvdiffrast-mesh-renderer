@@ -94,6 +94,16 @@ def _cv_image_for_path(array: np.ndarray, suffix: str) -> np.ndarray:
     raise ValueError(f"Unsupported output format: {suffix}")
 
 
+def _composite_rgba_over_background(array: np.ndarray, background_rgb: tuple[int, int, int]) -> np.ndarray:
+    if array.ndim != 3 or array.shape[-1] != 4:
+        raise ValueError("Background compositing requires an RGBA image")
+    background = np.asarray(background_rgb, dtype=np.float32).reshape(1, 1, 3)
+    alpha = array[..., 3:4].astype(np.float32) / 255.0
+    rgb = array[..., :3].astype(np.float32)
+    composited = np.rint(rgb * alpha + background * (1.0 - alpha)).clip(0.0, 255.0)
+    return np.ascontiguousarray(composited.astype(np.uint8))
+
+
 def save_image(
     path: pathlib.Path,
     image: HostImage | np.ndarray,
@@ -122,6 +132,22 @@ def encode_png_bytes(image: HostImage | np.ndarray, *, png_compression: int = DE
     ok, payload = cv2.imencode(".png", encoded, [int(cv2.IMWRITE_PNG_COMPRESSION), int(png_compression)])
     if not ok:
         raise RuntimeError("Failed to encode PNG bytes")
+    return payload.tobytes()
+
+
+def encode_jpg_bytes(
+    image: HostImage | np.ndarray,
+    *,
+    jpg_quality: int = DEFAULT_JPG_QUALITY,
+    background_rgb: tuple[int, int, int] | None = None,
+) -> bytes:
+    array = to_uint8_image(image)
+    if background_rgb is not None and array.ndim == 3 and array.shape[-1] == 4:
+        array = _composite_rgba_over_background(array, background_rgb)
+    encoded = _cv_image_for_path(array, ".jpg")
+    ok, payload = cv2.imencode(".jpg", encoded, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpg_quality)])
+    if not ok:
+        raise RuntimeError("Failed to encode JPEG bytes")
     return payload.tobytes()
 
 

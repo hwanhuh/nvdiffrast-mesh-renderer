@@ -61,6 +61,12 @@ def environment_brdf_approx(f0: torch.Tensor, roughness: torch.Tensor, n_dot_v: 
     return f0 * ab[..., :1] + ab[..., 1:2]
 
 
+def specular_occlusion(ao: torch.Tensor, n_dot_v: torch.Tensor, roughness: torch.Tensor) -> torch.Tensor:
+    exponent = torch.exp2((-16.0 * roughness) - 1.0)
+    visibility = torch.pow(torch.clamp(n_dot_v + ao, min=0.0), exponent) - 1.0 + ao
+    return torch.clamp(visibility, 0.0, 1.0)
+
+
 class ImageBasedLighting:
     def __init__(self, env: EnvironmentData, diffuse_samples: int, device: torch.device):
         self.env = env

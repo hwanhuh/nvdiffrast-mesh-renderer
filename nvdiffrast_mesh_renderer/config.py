@@ -349,7 +349,7 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         wireframe_color=parse_rgb(getattr(args, "wireframe_color", "0.2,1.0,0.25")),
         wireframe_opacity=float(np.clip(getattr(args, "wireframe_opacity", 1.0), 0.0, 1.0)),
         wireframe_thickness_px=max(float(getattr(args, "wireframe_thickness_px", 0.5)), 0.0),
-        double_sided_depth_peels=max(int(getattr(args, "double_sided_depth_peels", 4)), 1),
+        double_sided_depth_peels=max(int(getattr(args, "double_sided_depth_peels", 2)), 1),
         normalize_depth=bool(getattr(args, "normalize_depth", False)),
         png_compression=int(np.clip(int(getattr(args, "png_compression", 1)), 0, 9)),
         render_all=bool(getattr(args, "render_all", False)),

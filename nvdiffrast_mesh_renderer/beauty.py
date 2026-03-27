@@ -8,7 +8,15 @@ import nvdiffrast.torch as dr
 from .compositor import LayerCompositor
 from .config import RenderConfig
 from .geometry_pass import GeometryPassRenderer
-from .ibl import ImageBasedLighting, distribution_ggx, environment_brdf_approx, fresnel_schlick, fresnel_schlick_roughness, geometry_smith
+from .ibl import (
+    ImageBasedLighting,
+    distribution_ggx,
+    environment_brdf_approx,
+    fresnel_schlick,
+    fresnel_schlick_roughness,
+    geometry_smith,
+    specular_occlusion,
+)
 from .math_utils import safe_normalize
 from .textures import sample_texture
 from .types import CameraData, RenderImage, RenderLayer
@@ -204,7 +212,8 @@ class RenderModeRenderer:
             return torch.where(gbuf.valid.expand_as(base_rgb), shaded, torch.zeros_like(base_rgb))
         f0 = 0.04 * (1.0 - metallic) + base_rgb * metallic
         n_dot_v = torch.clamp(torch.sum(normal * view_dir, dim=-1, keepdim=True), min=1e-4, max=1.0)
-        shaded = emissive + ambient * base_rgb * (1.0 - metallic) * ao
+        fallback_ambient = ambient * 0.25 * base_rgb * (1.0 - metallic) * ao if self.ibl is None else torch.zeros_like(base_rgb)
+        shaded = emissive + fallback_ambient
         for light_dir, light_color in self.lights:
             light = safe_normalize(light_dir.expand_as(normal))
             half_vec = safe_normalize(view_dir + light)
@@ -218,8 +227,13 @@ class RenderModeRenderer:
             shaded = shaded + (diffuse + specular) * light_color * n_dot_l
         if self.ibl is not None and self.config.env_usage in {"light", "both"}:
             diffuse_weight = (1.0 - fresnel_schlick_roughness(n_dot_v, f0, roughness)) * (1.0 - metallic)
+            indirect_specular_occlusion = specular_occlusion(ao, n_dot_v, roughness)
             shaded = shaded + base_rgb * diffuse_weight * self.ibl.diffuse(normal) * ao
-            shaded = shaded + self.ibl.specular(normal, view_dir, roughness) * environment_brdf_approx(f0, roughness, n_dot_v)
+            shaded = shaded + (
+                self.ibl.specular(normal, view_dir, roughness)
+                * environment_brdf_approx(f0, roughness, n_dot_v)
+                * indirect_specular_occlusion
+            )
         return torch.where(gbuf.valid.expand_as(base_rgb), shaded, torch.zeros_like(base_rgb))
 
     def _oriented_world_normal(self, layer: RenderLayer) -> torch.Tensor:

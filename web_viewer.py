@@ -527,8 +527,8 @@ PAGE_HTML = """<!doctype html>
           <label class="slider-block">
             JPEG Background
             <div class="color-row">
-              <input id="backgroundColorInput" type="color" value="#ffffff">
-              <span class="color-value" id="backgroundColorValue">#ffffff</span>
+              <input id="backgroundColorInput" type="color" value="#8c8c8c">
+              <span class="color-value" id="backgroundColorValue">#8c8c8c</span>
             </div>
           </label>
 

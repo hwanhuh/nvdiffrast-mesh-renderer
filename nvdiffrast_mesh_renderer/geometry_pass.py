@@ -244,6 +244,6 @@ class GeometryPassRenderer:
             base_rgba.contiguous(),
             emissive.contiguous(),
             ao.contiguous(),
-            torch.clamp(roughness, 0.045, 1.0).contiguous(),
+            torch.clamp(roughness, 0.02, 1.0).contiguous(),
             torch.clamp(metallic, 0.0, 1.0).contiguous(),
         )

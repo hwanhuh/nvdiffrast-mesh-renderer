@@ -31,6 +31,7 @@ BATCH_OVERRIDE_KEYS = frozenset(
     {
         "resolution",
         "render_mode",
+        "png_compression",
         "fov",
         "distance",
         "distance_scale",
@@ -93,6 +94,7 @@ class RenderConfig:
     wireframe_thickness_px: float
     double_sided_depth_peels: int
     normalize_depth: bool
+    png_compression: int
     render_all: bool
     render_all_batch_size: int
     canonical_six_views: bool
@@ -240,6 +242,12 @@ def add_render_arguments(
         help="Maximum depth layers to peel per winding bucket for double-sided meshes. Use 1 to disable depth peeling.",
     )
     parser.add_argument("--normalize-depth", action="store_true", help="Normalize depth outputs across visible pixels for visualization")
+    parser.add_argument(
+        "--png-compression",
+        type=int,
+        default=1,
+        help="PNG compression level in [0, 9]. Lower values trade larger files for faster writes.",
+    )
     if include_render_all:
         parser.add_argument("--render-all", action="store_true", help="Render every supported mode into a mode-named output directory")
         parser.add_argument(
@@ -335,6 +343,7 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         wireframe_thickness_px=max(float(getattr(args, "wireframe_thickness_px", 0.5)), 0.0),
         double_sided_depth_peels=max(int(getattr(args, "double_sided_depth_peels", 4)), 1),
         normalize_depth=bool(getattr(args, "normalize_depth", False)),
+        png_compression=int(np.clip(int(getattr(args, "png_compression", 1)), 0, 9)),
         render_all=bool(getattr(args, "render_all", False)),
         render_all_batch_size=max(int(getattr(args, "render_all_batch_size", 4)), 1),
         canonical_six_views=bool(getattr(args, "canonical_six_views", False)),
@@ -391,6 +400,9 @@ def config_with_overrides(base_config: RenderConfig, overrides: dict[str, Any]) 
             continue
         if key in {"resolution", "env_diffuse_samples", "geometry_cuda_threshold_faces", "geometry_cuda_threshold_vertices"}:
             updates[key] = int(value)
+            continue
+        if key == "png_compression":
+            updates[key] = int(np.clip(int(value), 0, 9))
             continue
         if key == "double_sided_depth_peels":
             updates[key] = max(int(value), 1)

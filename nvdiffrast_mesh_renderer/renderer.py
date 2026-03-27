@@ -15,6 +15,7 @@ from .config import RenderConfig
 from .environment import EnvironmentService
 from .geometry_pass import GeometryPassRenderer
 from .geometry_utils import scene_bounds
+from .image_io import to_numpy_image
 from .ibl import ImageBasedLighting
 from .logging_utils import RunLogger
 from .postprocess import ImagePostprocessor
@@ -77,7 +78,7 @@ class SceneRenderer:
         )
         self.geometry = GeometryPassRenderer(self.glctx, config)
         self.compositor = LayerCompositor()
-        self.postprocessor = ImagePostprocessor(config)
+        self.postprocessor = ImagePostprocessor(config, device=self.device)
 
     def _log(self, message: str) -> None:
         if self.logger is not None:
@@ -162,7 +163,7 @@ class SceneRenderer:
         self.postprocessor.save(output_path, image)
         self._log(f"Saved render to {output_path}")
         if self.config.display:
-            util.display_image(image[..., :3], size=self.config.resolution, title=str(output_path))
+            util.display_image(to_numpy_image(image)[..., :3], size=self.config.resolution, title=str(output_path))
         return output_path
 
     def render_to_file(

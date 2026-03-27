@@ -79,6 +79,44 @@ class MaterialExtractorTests(unittest.TestCase):
             [(False, "RGB")],
         )
 
+    def test_extract_opaque_base_color_prefers_rgb_upload(self):
+        image = Image.new("RGBA", (2, 2), color=(128, 96, 64, 255))
+        mesh = SimpleNamespace(
+            vertices=np.zeros((3, 3), dtype=np.float32),
+            visual=SimpleNamespace(
+                material=trimesh_material.PBRMaterial(
+                    baseColorTexture=image,
+                    alphaMode="OPAQUE",
+                    baseColorFactor=[1.0, 1.0, 1.0, 1.0],
+                )
+            ),
+        )
+        cache = _FakeTextureCache()
+        extractor = MaterialExtractor(cache=cache, device=torch.device("cpu"))
+
+        extractor.extract(mesh)
+
+        self.assertIn((image, True, "RGB"), cache.calls)
+
+    def test_extract_blend_base_color_keeps_rgba_upload(self):
+        image = Image.new("RGBA", (2, 2), color=(128, 96, 64, 128))
+        mesh = SimpleNamespace(
+            vertices=np.zeros((3, 3), dtype=np.float32),
+            visual=SimpleNamespace(
+                material=trimesh_material.PBRMaterial(
+                    baseColorTexture=image,
+                    alphaMode="BLEND",
+                    baseColorFactor=[1.0, 1.0, 1.0, 1.0],
+                )
+            ),
+        )
+        cache = _FakeTextureCache()
+        extractor = MaterialExtractor(cache=cache, device=torch.device("cpu"))
+
+        extractor.extract(mesh)
+
+        self.assertIn((image, True, "RGBA"), cache.calls)
+
 
 class PackedOrmSamplingTests(unittest.TestCase):
     def test_sample_material_channels_fetches_packed_orm_once(self):

@@ -139,6 +139,9 @@ class MaterialExtractor:
         if material is None:
             return self._default(), vertex_colors
         if isinstance(material, trimesh_material.PBRMaterial):
+            alpha_mode = (material.alphaMode or "OPAQUE").upper()
+            base_color_factor = to_float_array(material.baseColorFactor, 4, [1.0, 1.0, 1.0, 1.0])
+            base_color_mode = "RGB" if alpha_mode == "OPAQUE" and base_color_factor[3] >= 0.999 else "RGBA"
             has_pbr_signals = any([material.metallicFactor is not None, material.roughnessFactor is not None, material.metallicRoughnessTexture is not None, material.normalTexture is not None, material.occlusionTexture is not None, material.emissiveTexture is not None, material.emissiveFactor is not None])
             metallic_roughness_texture = self.cache.get_pil(material.metallicRoughnessTexture, srgb=False, mode="RGB")
             shared_packed_orm = (
@@ -149,8 +152,8 @@ class MaterialExtractor:
             occlusion_texture = metallic_roughness_texture if shared_packed_orm else self.cache.get_pil(material.occlusionTexture, srgb=False, mode="L")
             return MaterialData(
                 workflow="pbr" if has_pbr_signals else "diffuse",
-                base_color_factor=torch.tensor(to_float_array(material.baseColorFactor, 4, [1.0, 1.0, 1.0, 1.0]), dtype=torch.float32, device=self.device),
-                base_color_texture=self.cache.get_pil(material.baseColorTexture, srgb=True, mode="RGBA"),
+                base_color_factor=torch.tensor(base_color_factor, dtype=torch.float32, device=self.device),
+                base_color_texture=self.cache.get_pil(material.baseColorTexture, srgb=True, mode=base_color_mode),
                 metallic_factor=1.0 if material.metallicFactor is None else float(material.metallicFactor),
                 roughness_factor=1.0 if material.roughnessFactor is None else float(material.roughnessFactor),
                 metallic_roughness_texture=metallic_roughness_texture,
@@ -160,17 +163,18 @@ class MaterialExtractor:
                 occlusion_strength=overrides.occlusion_strength,
                 emissive_factor=torch.tensor(to_float_array(material.emissiveFactor, 3, [0.0, 0.0, 0.0]), dtype=torch.float32, device=self.device),
                 emissive_texture=self.cache.get_pil(material.emissiveTexture, srgb=True, mode="RGB"),
-                alpha_mode=(material.alphaMode or "OPAQUE").upper(),
+                alpha_mode=alpha_mode,
                 alpha_cutoff=0.5 if material.alphaCutoff is None else float(material.alphaCutoff),
                 double_sided=bool(material.doubleSided),
                 has_pbr_signals=has_pbr_signals,
             ), vertex_colors
         if isinstance(material, trimesh_material.SimpleMaterial):
             diffuse = to_float_array(material.diffuse, 4, [1.0, 1.0, 1.0, 1.0])
+            alpha_mode = "BLEND" if diffuse[3] < 0.999 else "OPAQUE"
             return MaterialData(
                 workflow="diffuse",
                 base_color_factor=torch.tensor(diffuse, dtype=torch.float32, device=self.device),
-                base_color_texture=self.cache.get_pil(material.image, srgb=True, mode="RGBA"),
+                base_color_texture=self.cache.get_pil(material.image, srgb=True, mode="RGB" if alpha_mode == "OPAQUE" else "RGBA"),
                 metallic_factor=0.0,
                 roughness_factor=(2.0 / (float(material.glossiness) + 2.0)) ** 0.25 if material.glossiness is not None else 1.0,
                 metallic_roughness_texture=None,
@@ -180,7 +184,7 @@ class MaterialExtractor:
                 occlusion_strength=1.0,
                 emissive_factor=torch.zeros(3, dtype=torch.float32, device=self.device),
                 emissive_texture=None,
-                alpha_mode="BLEND" if diffuse[3] < 0.999 else "OPAQUE",
+                alpha_mode=alpha_mode,
                 alpha_cutoff=0.5,
                 double_sided=False,
                 has_pbr_signals=False,

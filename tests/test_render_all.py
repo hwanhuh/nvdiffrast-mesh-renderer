@@ -111,6 +111,13 @@ class RenderAllBatchConfigTests(unittest.TestCase):
 
         self.assertEqual(config.render_all_batch_size, 1)
 
+    def test_config_parses_png_compression(self):
+        parser = build_argparser()
+        args = parser.parse_args(["example.glb", "--png-compression", "2"])
+        config = config_from_args(args)
+
+        self.assertEqual(config.png_compression, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

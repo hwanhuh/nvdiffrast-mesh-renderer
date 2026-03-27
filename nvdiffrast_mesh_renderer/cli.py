@@ -7,6 +7,7 @@ import torch
 from .beauty import RenderModeRenderer
 from .config import build_argparser as _build_argparser
 from .config import config_from_args
+from .image_io import AsyncImageSaver
 from .lifecycle import RendererCache, is_cuda_failure, is_cuda_oom
 from .logging_utils import RunLogger, estimate_remaining_ms, format_duration_ms, format_path_notice
 from .renderer import SceneRenderer
@@ -246,6 +247,7 @@ def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
     scene_prepare_ms = 0.0
     render_ms_total = 0.0
     save_ms_total = 0.0
+    saver: AsyncImageSaver | None = None
     logger.log(
         f"Starting render-all run for {total_modes} mode(s) -> {output_dir}",
         console="always",
@@ -268,7 +270,30 @@ def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
         prepared = renderer.prepare_view(assets)
         scene_prepare_ms += (time.perf_counter() - prepare_start) * 1000.0
         outputs = []
+        saved_output_count = 0
         mode_rows: list[tuple[str, pathlib.Path, list[float] | None]] = []
+
+        def _record_completed_render_all_saves(completed: list[tuple[pathlib.Path, float]]) -> None:
+            nonlocal save_ms_total, saved_output_count
+            for saved_path, duration_ms in completed:
+                save_ms_total += duration_ms
+                outputs.append(saved_path)
+                saved_output_count += 1
+                elapsed_ms = (time.perf_counter() - progress_start) * 1000.0
+                eta_ms = estimate_remaining_ms(saved_output_count, total_modes, elapsed_ms)
+                logger.log(
+                    f"Completed render-all mode {saved_path.stem} ({saved_output_count}/{total_modes})",
+                    console="always",
+                    console_message=_progress_line(
+                        "render-all",
+                        saved_output_count,
+                        total_modes,
+                        item_label=saved_path.stem,
+                        last_ms=duration_ms,
+                        eta_ms=eta_ms,
+                    ),
+                )
+
         if config.benchmark_requested:
             for mode in RenderModeRenderer.SUPPORTED_MODES:
                 mode_started = time.perf_counter()
@@ -292,6 +317,7 @@ def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
                 renderer.save_image(image, mode_output)
                 save_ms_total += (time.perf_counter() - save_start) * 1000.0
                 outputs.append(mode_output)
+                saved_output_count += 1
                 elapsed_ms = (time.perf_counter() - progress_start) * 1000.0
                 mode_duration_ms = (time.perf_counter() - mode_started) * 1000.0
                 eta_ms = estimate_remaining_ms(len(outputs), total_modes, elapsed_ms)
@@ -308,6 +334,10 @@ def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
                     ),
                 )
         else:
+            saver = AsyncImageSaver(
+                max_pending=max(mode_batch_sizes[0], 2),
+                png_compression=config.png_compression,
+            )
             mode_index = 0
             batch_size_index = 0
             attempted_batch_sizes = [mode_batch_sizes[0]]
@@ -346,30 +376,12 @@ def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
                         scene_prepare_ms += (time.perf_counter() - prepare_start) * 1000.0
                         continue
                     raise
-                batch_duration_ms = (time.perf_counter() - batch_started) * 1000.0
-                avg_mode_duration_ms = batch_duration_ms / max(len(batch_modes), 1)
                 for mode in batch_modes:
                     mode_output = output_dir / f"{mode}{suffix}"
-                    save_start = time.perf_counter()
-                    renderer.save_image(batch_images[mode], mode_output)
-                    save_ms_total += (time.perf_counter() - save_start) * 1000.0
-                    outputs.append(mode_output)
                     mode_rows.append((mode, mode_output, None))
-                    elapsed_ms = (time.perf_counter() - progress_start) * 1000.0
-                    eta_ms = estimate_remaining_ms(len(outputs), total_modes, elapsed_ms)
-                    logger.log(
-                        f"Completed render-all mode {mode} ({len(outputs)}/{total_modes})",
-                        console="always",
-                        console_message=_progress_line(
-                            "render-all",
-                            len(outputs),
-                            total_modes,
-                            item_label=mode,
-                            last_ms=avg_mode_duration_ms,
-                            eta_ms=eta_ms,
-                        ),
-                    )
+                    _record_completed_render_all_saves(saver.submit(batch_images[mode], mode_output))
                 mode_index += len(batch_modes)
+            _record_completed_render_all_saves(saver.finish())
             if attempted_batch_sizes[-1] != attempted_batch_sizes[0]:
                 attempted = ",".join(str(size) for size in attempted_batch_sizes[:-1])
                 logger.log(
@@ -411,6 +423,11 @@ def _render_all_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
             renderer_cache.reset_after_cuda_failure(render_config)
         raise
     finally:
+        if saver is not None:
+            try:
+                saver.close()
+            except Exception:
+                pass
         renderer_cache.close()
 
 
@@ -435,12 +452,11 @@ def _render_multiview_chunk(
     output_dir: pathlib.Path,
     suffix: str,
     chunk_specs: list[tuple[int, str | None, float, float]],
-) -> tuple[list[pathlib.Path], list[tuple[int, str | None, float, float, pathlib.Path]], float, float, float]:
+) -> tuple[list[tuple[pathlib.Path, object]], list[tuple[int, str | None, float, float, pathlib.Path]], float, float]:
     prepared_rows = []
     rows = []
     prepare_views_ms = 0.0
     render_ms = 0.0
-    save_ms = 0.0
     for view_index, label, elev, azim in chunk_specs:
         view_config = replace(base_config, elev=elev, azim=azim)
         output_path = _multi_view_output_path(output_dir, suffix, view_index, elev, azim, label=label)
@@ -452,12 +468,8 @@ def _render_multiview_chunk(
     render_start = time.perf_counter()
     images = [renderer.render_prepared(prepared) for prepared, _output_path in prepared_rows]
     render_ms += (time.perf_counter() - render_start) * 1000.0
-    outputs = []
-    for (_prepared, output_path), image in zip(prepared_rows, images):
-        save_start = time.perf_counter()
-        outputs.append(renderer.save_image(image, output_path))
-        save_ms += (time.perf_counter() - save_start) * 1000.0
-    return outputs, rows, prepare_views_ms, render_ms, save_ms
+    outputs = [(output_path, image) for (_prepared, output_path), image in zip(prepared_rows, images)]
+    return outputs, rows, prepare_views_ms, render_ms
 
 
 def _render_multiview_pass(
@@ -481,79 +493,93 @@ def _render_multiview_pass(
     prepare_views_ms_total = 0.0
     render_ms_total = 0.0
     save_ms_total = 0.0
-    while chunk_start < len(view_specs):
-        chunk_size = chunk_sizes[chunk_size_index]
-        chunk_specs = view_specs[chunk_start: chunk_start + chunk_size]
-        chunk_index = (chunk_start // chunk_size) + 1
-        chunk_started = time.perf_counter()
-        logger.log(f"Rendering multi-view chunk {chunk_index} ({len(chunk_specs)} view(s), chunk size {chunk_size})")
-        init_start = time.perf_counter()
-        renderer, _created = renderer_cache.get_with_status(base_config)
-        if _created or renderer is not current_renderer:
-            session_init_ms += (time.perf_counter() - init_start) * 1000.0
-        current_renderer = renderer
-        try:
-            chunk_outputs, chunk_rows, chunk_prepare_views_ms, chunk_render_ms, chunk_save_ms = _render_multiview_chunk(
-                renderer,
-                assets,
-                base_config,
-                output_dir,
-                suffix,
-                chunk_specs,
-            )
-        except Exception as exc:
-            if is_cuda_oom(exc) and chunk_size_index + 1 < len(chunk_sizes):
-                next_chunk_size = chunk_sizes[chunk_size_index + 1]
-                renderer = None
-                logger.log(
-                    f"Multi-view chunk starting at index {chunk_start:04d} hit CUDA OOM ({exc!r}); "
-                    f"recreating renderer and retrying with chunk size {next_chunk_size}."
-                )
-                renderer_cache.reset_after_cuda_failure(base_config)
-                chunk_size_index += 1
-                attempted_chunk_sizes.append(next_chunk_size)
-                current_renderer = None
-                logger.log(
-                    f"Multi-view fallback to chunk size {next_chunk_size} after CUDA OOM at chunk start {chunk_start:04d}",
-                    console="always",
-                    console_message=f"[Info] Multi-View retry: chunk -> {next_chunk_size}",
-                )
-                continue
-            if is_cuda_failure(exc):
-                renderer = None
-                renderer_cache.reset_after_cuda_failure(base_config)
-            raise
-        outputs.extend(chunk_outputs)
-        rows.extend(chunk_rows)
-        prepare_views_ms_total += chunk_prepare_views_ms
-        render_ms_total += chunk_render_ms
-        save_ms_total += chunk_save_ms
-        elapsed_ms = (time.perf_counter() - progress_start) * 1000.0
-        chunk_duration_ms = (time.perf_counter() - chunk_started) * 1000.0
-        eta_ms = estimate_remaining_ms(len(rows), len(view_specs), elapsed_ms)
-        logger.log(
-            f"Completed multi-view chunk {chunk_index}; saved {len(rows)}/{len(view_specs)} view(s)",
-            console="always",
-            console_message=_progress_line(
-                "multi-view",
-                len(rows),
-                len(view_specs),
-                item_label=f"chunk {chunk_index}",
-                last_ms=chunk_duration_ms,
-                eta_ms=eta_ms,
-            ),
-        )
-        chunk_start += len(chunk_specs)
-    return (
-        outputs,
-        rows,
-        attempted_chunk_sizes,
-        chunk_sizes[chunk_size_index],
-        session_init_ms,
-        prepare_views_ms_total,
-        render_ms_total,
-        save_ms_total,
+    saver = AsyncImageSaver(
+        max_pending=max(chunk_sizes[0], 2),
+        png_compression=base_config.png_compression,
     )
+    try:
+        while chunk_start < len(view_specs):
+            chunk_size = chunk_sizes[chunk_size_index]
+            chunk_specs = view_specs[chunk_start: chunk_start + chunk_size]
+            chunk_index = (chunk_start // chunk_size) + 1
+            chunk_started = time.perf_counter()
+            logger.log(f"Rendering multi-view chunk {chunk_index} ({len(chunk_specs)} view(s), chunk size {chunk_size})")
+            init_start = time.perf_counter()
+            renderer, _created = renderer_cache.get_with_status(base_config)
+            if _created or renderer is not current_renderer:
+                session_init_ms += (time.perf_counter() - init_start) * 1000.0
+            current_renderer = renderer
+            try:
+                chunk_outputs, chunk_rows, chunk_prepare_views_ms, chunk_render_ms = _render_multiview_chunk(
+                    renderer,
+                    assets,
+                    base_config,
+                    output_dir,
+                    suffix,
+                    chunk_specs,
+                )
+            except Exception as exc:
+                if is_cuda_oom(exc) and chunk_size_index + 1 < len(chunk_sizes):
+                    next_chunk_size = chunk_sizes[chunk_size_index + 1]
+                    renderer = None
+                    logger.log(
+                        f"Multi-view chunk starting at index {chunk_start:04d} hit CUDA OOM ({exc!r}); "
+                        f"recreating renderer and retrying with chunk size {next_chunk_size}."
+                    )
+                    renderer_cache.reset_after_cuda_failure(base_config)
+                    chunk_size_index += 1
+                    attempted_chunk_sizes.append(next_chunk_size)
+                    current_renderer = None
+                    logger.log(
+                        f"Multi-view fallback to chunk size {next_chunk_size} after CUDA OOM at chunk start {chunk_start:04d}",
+                        console="always",
+                        console_message=f"[Info] Multi-View retry: chunk -> {next_chunk_size}",
+                    )
+                    continue
+                if is_cuda_failure(exc):
+                    renderer = None
+                    renderer_cache.reset_after_cuda_failure(base_config)
+                raise
+            for output_path, image in chunk_outputs:
+                outputs.append(output_path)
+                for _saved_path, duration_ms in saver.submit(image, output_path):
+                    save_ms_total += duration_ms
+            rows.extend(chunk_rows)
+            prepare_views_ms_total += chunk_prepare_views_ms
+            render_ms_total += chunk_render_ms
+            elapsed_ms = (time.perf_counter() - progress_start) * 1000.0
+            chunk_duration_ms = (time.perf_counter() - chunk_started) * 1000.0
+            eta_ms = estimate_remaining_ms(len(rows), len(view_specs), elapsed_ms)
+            logger.log(
+                f"Completed multi-view chunk {chunk_index}; saved {len(rows)}/{len(view_specs)} view(s)",
+                console="always",
+                console_message=_progress_line(
+                    "multi-view",
+                    len(rows),
+                    len(view_specs),
+                    item_label=f"chunk {chunk_index}",
+                    last_ms=chunk_duration_ms,
+                    eta_ms=eta_ms,
+                ),
+            )
+            chunk_start += len(chunk_specs)
+        for _saved_path, duration_ms in saver.finish():
+            save_ms_total += duration_ms
+        return (
+            outputs,
+            rows,
+            attempted_chunk_sizes,
+            chunk_sizes[chunk_size_index],
+            session_init_ms,
+            prepare_views_ms_total,
+            render_ms_total,
+            save_ms_total,
+        )
+    finally:
+        try:
+            saver.close()
+        except Exception:
+            pass
 
 
 # Standalone multi-view is also sequential: one renderer/context per invocation, no raster thread pool.

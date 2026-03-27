@@ -15,9 +15,9 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image
 
 from .config import RenderConfig, add_render_arguments, config_from_args, config_with_overrides
+from .image_io import AsyncImageSaver
 from .lifecycle import RendererCache, is_cuda_failure, is_cuda_oom
 from .logging_utils import RunLogger, estimate_remaining_ms, format_duration_ms, format_path_notice
 from .renderer import SceneRenderer
@@ -702,17 +702,6 @@ def _view_config_for_job(job: JobSpec, view: ViewSpec) -> RenderConfig:
         fov=job.render_config.fov if view.fov is None else view.fov,
     )
 
-
-def _save_image_array(image: np.ndarray, output_path: pathlib.Path, image_format: str, jpg_quality: int) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if image_format == "jpg":
-        rgb = (image[..., :3] * 255.0).round().clip(0, 255).astype(np.uint8)
-        Image.fromarray(rgb, mode="RGB").save(output_path, format="JPEG", quality=jpg_quality)
-        return
-    rgba = (image * 255.0).round().clip(0, 255).astype(np.uint8)
-    Image.fromarray(rgba, mode="RGBA").save(output_path, format="PNG")
-
-
 def _tensor_to_list(tensor: torch.Tensor) -> Any:
     return tensor.detach().cpu().tolist()
 
@@ -745,7 +734,7 @@ def _build_camera_entry(
     }
 
 
-def _render_chunk_arrays(renderer: SceneRenderer, prepared_rows: list[tuple[Any, ...]]) -> list[np.ndarray]:
+def _render_chunk_arrays(renderer: SceneRenderer, prepared_rows: list[tuple[Any, ...]]) -> list[Any]:
     # One nvdiffrast CUDA context is owned by one worker and used sequentially.
     return [renderer.render_prepared(prepared) for _view, _view_config, prepared, _image_name in prepared_rows]
 
@@ -758,34 +747,44 @@ def _run_render_attempt(job: JobSpec, renderer: SceneRenderer, assets: Any, chun
     save_ms = 0.0
     cameras: list[dict[str, Any]] = []
     image_suffix = ".jpg" if job.image_format == "jpg" else ".png"
-    for chunk_start in range(0, len(job.views), chunk_size):
-        chunk_views = job.views[chunk_start: chunk_start + chunk_size]
-        prepared_rows = []
-        for view in chunk_views:
-            view_config = _view_config_for_job(job, view)
+    saver = AsyncImageSaver(
+        max_pending=max(chunk_size, 2),
+        jpg_quality=job.jpg_quality,
+        png_compression=job.render_config.png_compression,
+    )
+    try:
+        for chunk_start in range(0, len(job.views), chunk_size):
+            chunk_views = job.views[chunk_start: chunk_start + chunk_size]
+            prepared_rows = []
+            for view in chunk_views:
+                view_config = _view_config_for_job(job, view)
+                start = time.perf_counter()
+                prepared = renderer.prepare_view(assets, config=view_config)
+                prepare_views_ms += (time.perf_counter() - start) * 1000.0
+                image_name = f"{view.index:04d}_{view.name}{image_suffix}"
+                prepared_rows.append((view, view_config, prepared, image_name))
             start = time.perf_counter()
-            prepared = renderer.prepare_view(assets, config=view_config)
-            prepare_views_ms += (time.perf_counter() - start) * 1000.0
-            image_name = f"{view.index:04d}_{view.name}{image_suffix}"
-            prepared_rows.append((view, view_config, prepared, image_name))
-        start = time.perf_counter()
-        images = _render_chunk_arrays(renderer, prepared_rows)
-        render_ms += (time.perf_counter() - start) * 1000.0
-        for (view, view_config, prepared, image_name), image in zip(prepared_rows, images):
-            start = time.perf_counter()
-            _save_image_array(image, temp_output_dir / image_name, job.image_format, job.jpg_quality)
-            save_ms += (time.perf_counter() - start) * 1000.0
-            cameras.append(
-                _build_camera_entry(
-                    job=job,
-                    view=view,
-                    view_config=view_config,
-                    prepared=prepared,
-                    scene_center=assets.center,
-                    image_name=image_name,
+            images = _render_chunk_arrays(renderer, prepared_rows)
+            render_ms += (time.perf_counter() - start) * 1000.0
+            for (view, view_config, prepared, image_name), image in zip(prepared_rows, images):
+                output_path = temp_output_dir / image_name
+                for _saved_path, duration_ms in saver.submit(image, output_path):
+                    save_ms += duration_ms
+                cameras.append(
+                    _build_camera_entry(
+                        job=job,
+                        view=view,
+                        view_config=view_config,
+                        prepared=prepared,
+                        scene_center=assets.center,
+                        image_name=image_name,
+                    )
                 )
-            )
-    return cameras, prepare_views_ms, render_ms, save_ms
+        for _saved_path, duration_ms in saver.finish():
+            save_ms += duration_ms
+        return cameras, prepare_views_ms, render_ms, save_ms
+    finally:
+        saver.close()
 
 
 def _build_cameras_payload(job: JobSpec, cameras: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1303,6 +1302,8 @@ def main() -> None:
         raise ValueError("--meshes-per-output-shard must be positive")
     if not 1 <= args.jpg_quality <= 100:
         raise ValueError("--jpg-quality must be in [1, 100]")
+    if not 0 <= args.png_compression <= 9:
+        raise ValueError("--png-compression must be in [0, 9]")
 
     manifest_path = pathlib.Path(args.manifest).expanduser().resolve()
     if not manifest_path.is_file():

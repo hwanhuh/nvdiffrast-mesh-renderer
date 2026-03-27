@@ -30,6 +30,7 @@ _CACHE_KEY_EXCLUDED_FIELDS = frozenset(
         "render_all_batch_size",
         "display",
         "print_progress",
+        "png_compression",
         "benchmark_requested",
         "benchmark_runs",
         "benchmark_warmup_runs",

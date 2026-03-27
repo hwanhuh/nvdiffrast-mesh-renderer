@@ -1,18 +1,23 @@
 import pathlib
 
-import imageio
-import numpy as np
 import torch
 
 from .config import RenderConfig
+from .image_io import DEFAULT_JPG_QUALITY, HostImage, save_image, stage_host_image
 from .math_utils import aces_tonemap, linear_to_srgb, reinhard_tonemap
 
 
 class ImagePostprocessor:
-    def __init__(self, config: RenderConfig):
+    def __init__(self, config: RenderConfig, device: torch.device | None = None):
         self.config = config
+        self.device = torch.device("cpu") if device is None else torch.device(device)
+        self._copy_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self.device.type == "cuda" and torch.cuda.is_available()
+            else None
+        )
 
-    def postprocess(self, rgb: torch.Tensor, alpha: torch.Tensor, render_mode: str | None = None) -> np.ndarray:
+    def postprocess(self, rgb: torch.Tensor, alpha: torch.Tensor, render_mode: str | None = None) -> HostImage:
         mode = self.config.render_mode if render_mode is None else render_mode
         rgb = torch.where(alpha > 1e-8, rgb / torch.clamp(alpha, min=1e-8), torch.zeros_like(rgb))
         if mode in {"depth_ndc", "depth_linear"} and self.config.normalize_depth:
@@ -32,8 +37,9 @@ class ImagePostprocessor:
             rgb = torch.clamp(linear_to_srgb(torch.clamp(rgb, 0.0, 1.0)), 0.0, 1.0)
         else:
             rgb = torch.clamp(rgb, 0.0, 1.0)
-        image = torch.cat([rgb, torch.clamp(alpha, 0.0, 1.0)], dim=-1)[0].flip(0).cpu().numpy()
-        return image
+        image = torch.cat([rgb, torch.clamp(alpha, 0.0, 1.0)], dim=-1)[0].flip(0)
+        image_u8 = torch.round(image * 255.0).clamp(0.0, 255.0).to(torch.uint8)
+        return stage_host_image(image_u8, copy_stream=self._copy_stream)
 
     def _normalize_visible(self, rgb: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
         visible = alpha[..., 0] > 1e-5
@@ -48,8 +54,5 @@ class ImagePostprocessor:
             normalized = (scalar - min_val) / (max_val - min_val)
         return normalized.expand_as(rgb)
 
-    def save(self, path: pathlib.Path, image: np.ndarray) -> None:
-        if path.suffix.lower() in {".jpg", ".jpeg"}:
-            imageio.imwrite(path, (image[..., :3] * 255.0).round().clip(0, 255).astype(np.uint8))
-            return
-        imageio.imwrite(path, (image * 255.0).round().clip(0, 255).astype(np.uint8))
+    def save(self, path: pathlib.Path, image: HostImage) -> None:
+        save_image(path, image, jpg_quality=DEFAULT_JPG_QUALITY, png_compression=self.config.png_compression)

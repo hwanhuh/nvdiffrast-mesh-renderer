@@ -55,8 +55,9 @@ def mip_level_count(height: int, width: int) -> int:
 
 
 def make_gpu_texture(array: np.ndarray, device: torch.device, srgb: bool) -> GpuTexture:
-    array = np.flip(array[..., None] if array.ndim == 2 else array, axis=0).copy()
-    tensor = torch.from_numpy(array).to(device, dtype=torch.float32)
+    array = array[..., None] if array.ndim == 2 else array
+    tensor = torch.from_numpy(np.ascontiguousarray(array)).to(device, dtype=torch.float32)
+    tensor = torch.flip(tensor, dims=(0,))
     if srgb and tensor.shape[-1] >= 3:
         rgb = srgb_to_linear(tensor[..., :3])
         tensor = torch.cat([rgb, tensor[..., 3:]], dim=-1) if tensor.shape[-1] > 3 else rgb

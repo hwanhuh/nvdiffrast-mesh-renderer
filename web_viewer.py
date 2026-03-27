@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import io
 import json
 import shutil
 import tempfile
@@ -18,8 +17,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-
-from PIL import Image
 
 PAGE_HTML = """<!doctype html>
 <html lang="ko">
@@ -1192,10 +1189,9 @@ class ViewerBackend:
         return self._image_to_png(image), elapsed_ms, resolution
 
     def _image_to_png(self, image) -> bytes:
-        rgba = (image * 255.0).round().clip(0, 255).astype("uint8")
-        with io.BytesIO() as buffer:
-            Image.fromarray(rgba, mode="RGBA").save(buffer, format="PNG")
-            return buffer.getvalue()
+        from nvdiffrast_mesh_renderer.image_io import encode_png_bytes
+
+        return encode_png_bytes(image, png_compression=1)
 
     def close(self) -> None:
         for renderer_state in self._renderer_states.values():

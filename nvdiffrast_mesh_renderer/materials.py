@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import trimesh
 from trimesh.visual import material as trimesh_material
+from PIL import Image
 
 from .math_utils import to_float_array
 from .textures import TextureCache
@@ -19,6 +20,63 @@ class GltfMaterialOverrides:
     normal_scale: float = 1.0
     occlusion_strength: float = 1.0
     packed_orm: bool = False
+
+
+_DOWNSCALE_RESAMPLE = getattr(Image, "Resampling", Image).BOX
+
+
+def resize_texture_image(image: Image.Image | None, max_size: int) -> Image.Image | None:
+    if image is None or max_size <= 0:
+        return image
+    if not isinstance(image, Image.Image):
+        return image
+    width, height = image.size
+    longest_side = max(width, height)
+    if longest_side <= max_size:
+        return image
+    scale = float(max_size) / float(longest_side)
+    resized = image.resize(
+        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+        resample=_DOWNSCALE_RESAMPLE,
+    )
+    resized.format = image.format
+    return resized
+
+
+def resize_scene_material_textures(scene: trimesh.Scene, max_size: int) -> int:
+    if max_size <= 0:
+        return 0
+    resized_count = 0
+    resized_images: dict[int, Image.Image] = {}
+    for mesh in scene.geometry.values():
+        material = getattr(getattr(mesh, "visual", None), "material", None)
+        if material is None:
+            continue
+        if isinstance(material, trimesh_material.PBRMaterial):
+            texture_fields = (
+                "baseColorTexture",
+                "metallicRoughnessTexture",
+                "normalTexture",
+                "occlusionTexture",
+                "emissiveTexture",
+            )
+        elif isinstance(material, trimesh_material.SimpleMaterial):
+            texture_fields = ("image",)
+        else:
+            continue
+        for field_name in texture_fields:
+            image = getattr(material, field_name, None)
+            if not isinstance(image, Image.Image):
+                continue
+            cache_key = id(image)
+            resized = resized_images.get(cache_key)
+            if resized is None:
+                resized = resize_texture_image(image, max_size)
+                resized_images[cache_key] = resized
+                if resized is not image:
+                    resized_count += 1
+            setattr(material, field_name, resized)
+    return resized_count
 
 
 def load_gltf_header(path: pathlib.Path) -> Optional[dict]:

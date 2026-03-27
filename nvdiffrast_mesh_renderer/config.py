@@ -53,6 +53,7 @@ BATCH_OVERRIDE_KEYS = frozenset(
         "geometry_preprocess_device",
         "geometry_cuda_threshold_faces",
         "geometry_cuda_threshold_vertices",
+        "texture_map_max_size",
     }
 )
 
@@ -102,6 +103,7 @@ class RenderConfig:
     geometry_preprocess_device: str
     geometry_cuda_threshold_faces: int
     geometry_cuda_threshold_vertices: int
+    texture_map_max_size: int
     benchmark_requested: bool
     benchmark_runs: int
     benchmark_warmup_runs: int
@@ -278,6 +280,12 @@ def add_render_arguments(
         default=100000,
         help="In auto mode, use CUDA preprocessing when a mesh has at least this many vertices.",
     )
+    parser.add_argument(
+        "--texture-map-max-size",
+        type=int,
+        default=2048,
+        help="If > 0, downscale mesh material texture maps so their longest side does not exceed this size before GPU upload.",
+    )
     if include_benchmark:
         parser.add_argument("--benchmark-runs", type=int, default=None, help="Enable render-all benchmarking and set timed runs per mode")
         parser.add_argument("--benchmark-warmup-runs", type=int, default=None, help="Enable render-all benchmarking and set untimed warmup runs per mode")
@@ -351,6 +359,7 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         geometry_preprocess_device=str(getattr(args, "geometry_preprocess_device", "auto")),
         geometry_cuda_threshold_faces=max(int(getattr(args, "geometry_cuda_threshold_faces", 100000)), 0),
         geometry_cuda_threshold_vertices=max(int(getattr(args, "geometry_cuda_threshold_vertices", 100000)), 0),
+        texture_map_max_size=max(int(getattr(args, "texture_map_max_size", 0)), 0),
         benchmark_requested=benchmark_requested,
         benchmark_runs=benchmark_runs,
         benchmark_warmup_runs=benchmark_warmup_runs,
@@ -398,7 +407,7 @@ def config_with_overrides(base_config: RenderConfig, overrides: dict[str, Any]) 
         if key == "geometry_preprocess_device":
             updates[key] = _validate_choice(key, str(value), GEOMETRY_PREPROCESS_DEVICE_CHOICES)
             continue
-        if key in {"resolution", "env_diffuse_samples", "geometry_cuda_threshold_faces", "geometry_cuda_threshold_vertices"}:
+        if key in {"resolution", "env_diffuse_samples", "geometry_cuda_threshold_faces", "geometry_cuda_threshold_vertices", "texture_map_max_size"}:
             updates[key] = int(value)
             continue
         if key == "png_compression":

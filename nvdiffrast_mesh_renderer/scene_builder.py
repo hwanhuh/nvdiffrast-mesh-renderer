@@ -1,4 +1,5 @@
 import pathlib
+from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
 import numpy as np
@@ -13,10 +14,25 @@ from .geometry_utils import (
     compute_vertex_tangents_torch,
     scene_bounds,
 )
-from .materials import MaterialExtractor, load_gltf_material_overrides
+from .materials import GltfMaterialOverrides, MaterialExtractor, load_gltf_material_overrides, resize_scene_material_textures
 from .math_utils import look_at, orbit_camera, perspective, safe_normalize, safe_normalize_np
 from .textures import TextureCache
 from .types import CameraData, MeshData
+
+
+@dataclass(frozen=True)
+class PreloadedSceneAsset:
+    path: pathlib.Path
+    scene: trimesh.Scene
+    overrides: dict[str, GltfMaterialOverrides]
+
+
+def preload_scene_asset(path: pathlib.Path, texture_map_max_size: int = 0) -> PreloadedSceneAsset:
+    overrides = load_gltf_material_overrides(path)
+    scene_or_mesh = trimesh.load(path, force="scene", process=False)
+    scene = scene_or_mesh if isinstance(scene_or_mesh, trimesh.Scene) else trimesh.Scene(scene_or_mesh)
+    resize_scene_material_textures(scene, max(int(texture_map_max_size), 0))
+    return PreloadedSceneAsset(path=path, scene=scene, overrides=overrides)
 
 
 class SceneBuilder:
@@ -27,11 +43,14 @@ class SceneBuilder:
         self._geometry_preprocess_device = "auto"
         self._geometry_cuda_threshold_faces = 100000
         self._geometry_cuda_threshold_vertices = 100000
+        self._texture_map_max_size = 0
 
     def load_meshes(self, path: pathlib.Path) -> List[MeshData]:
-        overrides = load_gltf_material_overrides(path)
-        scene_or_mesh = trimesh.load(path, force="scene", process=False)
-        scene = scene_or_mesh if isinstance(scene_or_mesh, trimesh.Scene) else trimesh.Scene(scene_or_mesh)
+        return self.load_meshes_from_preloaded(preload_scene_asset(path, self._texture_map_max_size))
+
+    def load_meshes_from_preloaded(self, preloaded: PreloadedSceneAsset) -> List[MeshData]:
+        scene = preloaded.scene
+        overrides = preloaded.overrides
         meshes = []
         used_names = {}
         used_name_counts = {}
@@ -157,6 +176,7 @@ class SceneBuilder:
         self._geometry_preprocess_device = config.geometry_preprocess_device
         self._geometry_cuda_threshold_faces = config.geometry_cuda_threshold_faces
         self._geometry_cuda_threshold_vertices = config.geometry_cuda_threshold_vertices
+        self._texture_map_max_size = config.texture_map_max_size
 
     def _clip_planes_from_meshes(self, meshes: Sequence[MeshData], view: np.ndarray) -> tuple[float, float]:
         view_t = torch.as_tensor(view, dtype=torch.float32, device=self.device)

@@ -1041,6 +1041,7 @@ class ViewerBackend:
             geometry_preprocess_device="auto",
             geometry_cuda_threshold_faces=100000,
             geometry_cuda_threshold_vertices=100000,
+            texture_map_max_size=0,
             benchmark_runs=None,
             benchmark_warmup_runs=None,
             no_antialias=False,

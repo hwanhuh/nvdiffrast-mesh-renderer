@@ -11,7 +11,13 @@ from PIL import Image
 from trimesh.visual import material as trimesh_material
 
 from nvdiffrast_mesh_renderer.geometry_pass import GeometryPassRenderer
-from nvdiffrast_mesh_renderer.materials import GltfMaterialOverrides, MaterialExtractor, load_gltf_material_overrides
+from nvdiffrast_mesh_renderer.materials import (
+    GltfMaterialOverrides,
+    MaterialExtractor,
+    load_gltf_material_overrides,
+    resize_scene_material_textures,
+    resize_texture_image,
+)
 
 
 class _FakeTextureCache:
@@ -57,6 +63,33 @@ class MaterialOverrideTests(unittest.TestCase):
 
 
 class MaterialExtractorTests(unittest.TestCase):
+    def test_resize_texture_image_caps_longest_side(self):
+        image = Image.new("RGBA", (8, 4), color=(128, 96, 64, 255))
+
+        resized = resize_texture_image(image, 4)
+
+        self.assertEqual(resized.size, (4, 2))
+
+    def test_resize_scene_material_textures_reuses_shared_images(self):
+        image = Image.new("RGB", (8, 4), color=(128, 96, 64))
+        material = trimesh_material.PBRMaterial(
+            baseColorTexture=image,
+            occlusionTexture=image,
+        )
+        scene = SimpleNamespace(
+            geometry={
+                "mesh": SimpleNamespace(
+                    visual=SimpleNamespace(material=material)
+                )
+            }
+        )
+
+        resized_count = resize_scene_material_textures(scene, 4)
+
+        self.assertEqual(resized_count, 1)
+        self.assertEqual(material.baseColorTexture.size, (4, 2))
+        self.assertIs(material.baseColorTexture, material.occlusionTexture)
+
     def test_extract_reuses_single_texture_for_packed_orm(self):
         image = Image.new("RGB", (2, 2), color=(128, 96, 64))
         mesh = SimpleNamespace(

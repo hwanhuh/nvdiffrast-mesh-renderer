@@ -19,7 +19,7 @@ from .image_io import to_numpy_image
 from .ibl import ImageBasedLighting
 from .logging_utils import RunLogger
 from .postprocess import ImagePostprocessor
-from .scene_builder import SceneBuilder
+from .scene_builder import PreloadedSceneAsset, SceneBuilder
 from .textures import TextureCache
 from .types import CameraData, EnvironmentData, MeshData, RenderImage
 
@@ -87,8 +87,12 @@ class SceneRenderer:
     def clear_texture_cache(self) -> None:
         self.cache.clear()
 
-    def prepare_assets(self, input_path: pathlib.Path) -> PreparedAssets:
-        meshes = self.scene_builder.load_meshes(input_path)
+    def prepare_assets(self, input_path: pathlib.Path, preloaded_scene: PreloadedSceneAsset | None = None) -> PreparedAssets:
+        meshes = (
+            self.scene_builder.load_meshes(input_path)
+            if preloaded_scene is None
+            else self.scene_builder.load_meshes_from_preloaded(preloaded_scene)
+        )
         if not meshes:
             raise RuntimeError(f"No renderable meshes found in {input_path}")
         pbr_count = sum(mesh.material.workflow == "pbr" for mesh in meshes)

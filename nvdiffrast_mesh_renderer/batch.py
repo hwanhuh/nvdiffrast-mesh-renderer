@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import time
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +22,7 @@ from .image_io import AsyncImageSaver
 from .lifecycle import RendererCache, is_cuda_failure, is_cuda_oom
 from .logging_utils import RunLogger, estimate_remaining_ms, format_duration_ms, format_path_notice
 from .renderer import SceneRenderer
+from .scene_builder import PreloadedSceneAsset, preload_scene_asset
 
 CANONICAL_SIX_VIEW_SPECS = (
     ("front", 0.0, 0.0),
@@ -96,8 +98,19 @@ class WorkerState:
     job_queue: Any
     process: mp.Process
     current_job: JobSpec | None = None
+    queued_job: JobSpec | None = None
     current_started_at: str | None = None
     current_started_mono: float | None = None
+
+
+@dataclass(frozen=True)
+class PrefetchedJob:
+    job: JobSpec | None
+    preloaded_scene: PreloadedSceneAsset | None = None
+    preload_ms: float = 0.0
+    error_type: str | None = None
+    error_message: str | None = None
+    traceback_text: str | None = None
 
 
 def _utc_now() -> str:
@@ -895,7 +908,96 @@ def _write_failed_job_report_if_needed(
     _write_json(temp_output_dir / "job_report.json", report)
 
 
-def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, worker_slot: int, logger: RunLogger) -> dict[str, Any]:
+def _prefetch_job(job_queue: Any) -> PrefetchedJob:
+    job = job_queue.get()
+    if job is None:
+        return PrefetchedJob(job=None)
+    started = time.perf_counter()
+    try:
+        preloaded_scene = preload_scene_asset(
+            pathlib.Path(job.input_path),
+            texture_map_max_size=job.render_config.texture_map_max_size,
+        )
+        return PrefetchedJob(
+            job=job,
+            preloaded_scene=preloaded_scene,
+            preload_ms=(time.perf_counter() - started) * 1000.0,
+        )
+    except Exception as exc:
+        return PrefetchedJob(
+            job=job,
+            preloaded_scene=None,
+            preload_ms=(time.perf_counter() - started) * 1000.0,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            traceback_text=traceback.format_exc(),
+        )
+
+
+def _prefetch_failure_result(
+    job: JobSpec,
+    *,
+    worker_slot: int,
+    gpu_index: int,
+    preload_ms: float,
+    error_type: str,
+    error_message: str,
+    traceback_text: str | None,
+) -> dict[str, Any]:
+    finished_at = _utc_now()
+    started_at = finished_at
+    _write_failed_job_report_if_needed(
+        job,
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_ms=preload_ms,
+        session_init_ms=0.0,
+        prepare_assets_ms=preload_ms,
+        prepare_views_ms_total=0.0,
+        render_ms_total=0.0,
+        save_ms_total=0.0,
+        view_chunk_sizes_attempted=[],
+        view_chunk_size_used=None,
+        oom_retries=0,
+        error_type=error_type,
+        error_message=error_message,
+        traceback_text=traceback_text,
+    )
+    return {
+        "worker_slot": worker_slot,
+        "worker_id": f"worker-{worker_slot}-gpu{gpu_index}",
+        "gpu_index": gpu_index,
+        "mesh_id": job.mesh_id,
+        "input_path": job.input_path,
+        "output_dir": job.output_dir,
+        "status": "failed",
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_ms": preload_ms,
+        "session_init_ms": 0.0,
+        "prepare_assets_ms": preload_ms,
+        "prepare_views_ms_total": 0.0,
+        "render_ms_total": 0.0,
+        "save_ms_total": 0.0,
+        "view_count": len(job.views),
+        "view_chunk_sizes_attempted": [],
+        "view_chunk_size_used": None,
+        "oom_retries": 0,
+        "error_type": error_type,
+        "error_message": error_message,
+        "traceback": traceback_text,
+    }
+
+
+def _execute_job(
+    job: JobSpec,
+    gpu_index: int,
+    renderer_cache: RendererCache,
+    worker_slot: int,
+    logger: RunLogger,
+    *,
+    preloaded_scene: PreloadedSceneAsset | None = None,
+) -> dict[str, Any]:
     torch.cuda.set_device(gpu_index)
     worker_id = f"worker-{worker_slot}-gpu{gpu_index}"
     output_dir = pathlib.Path(job.output_dir)
@@ -925,7 +1027,7 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
         if created:
             session_init_ms += (time.perf_counter() - init_start) * 1000.0
         prepare_start = time.perf_counter()
-        assets = renderer.prepare_assets(pathlib.Path(job.input_path))
+        assets = renderer.prepare_assets(pathlib.Path(job.input_path), preloaded_scene=preloaded_scene)
         prepare_assets_ms = (time.perf_counter() - prepare_start) * 1000.0
         last_exc: BaseException | None = None
         cameras: list[dict[str, Any]] | None = None
@@ -1075,31 +1177,97 @@ def _execute_job(job: JobSpec, gpu_index: int, renderer_cache: RendererCache, wo
         renderer_cache.release_cuda_memory()
 
 
-def _worker_main(worker_slot: int, gpu_index: int, job_queue: Any, result_queue: Any, log_path: str, echo: bool) -> None:
+def _worker_main(
+    worker_slot: int,
+    gpu_index: int,
+    job_queue: Any,
+    result_queue: Any,
+    log_path: str,
+    echo: bool,
+    enable_prefetch: bool,
+) -> None:
     torch.cuda.set_device(gpu_index)
     # Batch mode isolates concurrency at the process level; each worker uses one renderer/context sequentially.
     logger = RunLogger(pathlib.Path(log_path), echo=echo, prefix=f"worker-{worker_slot}-gpu{gpu_index}")
     renderer_cache = RendererCache(device=torch.device(f"cuda:{gpu_index}"), logger=logger)
-    while True:
-        job = job_queue.get()
-        if job is None:
-            renderer_cache.close()
-            return
-        result_queue.put(_execute_job(job, gpu_index, renderer_cache, worker_slot, logger))
+    prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"worker-{worker_slot}-prefetch") if enable_prefetch else None
+    prefetch_future: Future[PrefetchedJob] | None = None
+    prefetched_job: PrefetchedJob | None = None
+    try:
+        while True:
+            if prefetched_job is None and prefetch_future is not None:
+                prefetched_job = prefetch_future.result()
+                prefetch_future = None
+            if prefetched_job is None:
+                job = job_queue.get()
+                current = PrefetchedJob(job=job)
+            else:
+                current = prefetched_job
+                prefetched_job = None
+            if current.job is None:
+                renderer_cache.close()
+                return
+            if enable_prefetch and prefetch_executor is not None and prefetch_future is None:
+                prefetch_future = prefetch_executor.submit(_prefetch_job, job_queue)
+            if current.error_type is not None:
+                result_queue.put(
+                    _prefetch_failure_result(
+                        current.job,
+                        worker_slot=worker_slot,
+                        gpu_index=gpu_index,
+                        preload_ms=current.preload_ms,
+                        error_type=current.error_type,
+                        error_message=current.error_message or current.error_type,
+                        traceback_text=current.traceback_text,
+                    )
+                )
+                continue
+            result_queue.put(
+                _execute_job(
+                    current.job,
+                    gpu_index,
+                    renderer_cache,
+                    worker_slot,
+                    logger,
+                    preloaded_scene=current.preloaded_scene,
+                )
+            )
+    finally:
+        if prefetch_executor is not None:
+            prefetch_executor.shutdown(wait=False, cancel_futures=True)
 
 
-def _start_worker(ctx: mp.context.BaseContext, slot: int, gpu_index: int, result_queue: Any, log_path: str, echo: bool) -> WorkerState:
+def _start_worker(
+    ctx: mp.context.BaseContext,
+    slot: int,
+    gpu_index: int,
+    result_queue: Any,
+    log_path: str,
+    echo: bool,
+    enable_prefetch: bool,
+) -> WorkerState:
     job_queue = ctx.Queue()
-    process = ctx.Process(target=_worker_main, args=(slot, gpu_index, job_queue, result_queue, log_path, echo), daemon=True)
+    process = ctx.Process(
+        target=_worker_main,
+        args=(slot, gpu_index, job_queue, result_queue, log_path, echo, enable_prefetch),
+        daemon=True,
+    )
     process.start()
     return WorkerState(slot=slot, gpu_index=gpu_index, job_queue=job_queue, process=process)
 
 
-def _restart_worker(ctx: mp.context.BaseContext, worker: WorkerState, result_queue: Any, log_path: str, echo: bool) -> WorkerState:
+def _restart_worker(
+    ctx: mp.context.BaseContext,
+    worker: WorkerState,
+    result_queue: Any,
+    log_path: str,
+    echo: bool,
+    enable_prefetch: bool,
+) -> WorkerState:
     if worker.process.is_alive():
         worker.process.terminate()
     worker.process.join(timeout=5)
-    return _start_worker(ctx, worker.slot, worker.gpu_index, result_queue, log_path, echo)
+    return _start_worker(ctx, worker.slot, worker.gpu_index, result_queue, log_path, echo, enable_prefetch)
 
 
 def _stop_worker(worker: WorkerState) -> None:
@@ -1261,6 +1429,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--view-preset", default=None, help="Named global view preset")
     parser.add_argument("--view-chunk-sizes", default="24,8,4,2,1", help="Descending view chunk sizes for CUDA OOM fallback")
     parser.add_argument("--default-view-name-template", default=None, help="Template for unnamed views; defaults to legacy elev/azim naming")
+    parser.add_argument(
+        "--no-prefetch-next-mesh",
+        action="store_true",
+        help="Disable worker-local CPU preload of the next mesh while the current mesh is rendering.",
+    )
     add_render_arguments(
         parser,
         include_input=False,
@@ -1314,6 +1487,7 @@ def main() -> None:
     batch_logger.reset()
 
     base_config = config_from_args(args)
+    enable_prefetch = not bool(args.no_prefetch_next_mesh)
     global_view_source = _build_global_view_source(args)
     gpu_list = _parse_gpu_list(args.gpus)
     view_chunk_sizes = _parse_view_chunk_sizes(args.view_chunk_sizes)
@@ -1335,10 +1509,11 @@ def main() -> None:
         total_rows=len(raw_rows),
         selected_rows=len(selected_entries),
         gpu_list=gpu_list,
+        enable_prefetch=enable_prefetch,
     )
     batch_logger.log(
         f"Started batch run: manifest={manifest_path}, output_root={output_root}, "
-        f"selected_rows={len(selected_entries)}, gpus={gpu_list}"
+        f"selected_rows={len(selected_entries)}, gpus={gpu_list}, prefetch={str(enable_prefetch).lower()}"
     )
 
     success_count = 0
@@ -1361,6 +1536,37 @@ def main() -> None:
                 f"(last: {format_duration_ms(last_ms)} / ETA: {format_duration_ms(eta_ms)})"
             ),
         )
+
+    def _start_job_on_worker(worker: WorkerState, job: JobSpec, *, enqueue: bool) -> None:
+        started_at = _utc_now()
+        _upsert_status(
+            conn,
+            mesh_id=job.mesh_id,
+            input_path=job.input_path,
+            status="running",
+            output_dir=job.output_dir,
+            started_at=started_at,
+            finished_at=None,
+            error_type=None,
+            error_message=None,
+            worker_id=f"worker-{worker.slot}-gpu{worker.gpu_index}",
+            gpu_index=worker.gpu_index,
+            increment_attempt=True,
+        )
+        _record_event(
+            events_path,
+            "job_started",
+            mesh_id=job.mesh_id,
+            row_index=job.row_index,
+            gpu_index=worker.gpu_index,
+            worker_id=f"worker-{worker.slot}-gpu{worker.gpu_index}",
+            output_dir=job.output_dir,
+        )
+        if enqueue:
+            worker.job_queue.put(job)
+        worker.current_job = job
+        worker.current_started_at = started_at
+        worker.current_started_mono = time.monotonic()
 
     batch_logger.log(
         f"Batch progress initialized for {total_selected} selected row(s).",
@@ -1481,48 +1687,37 @@ def main() -> None:
         result_queue = ctx.Queue()
         log_path = str(_batch_log_path(output_root))
         echo = bool(args.print_progress)
-        workers = [_start_worker(ctx, slot, gpu_index, result_queue, log_path, echo) for slot, gpu_index in enumerate(gpu_list)]
+        workers = [
+            _start_worker(ctx, slot, gpu_index, result_queue, log_path, echo, enable_prefetch)
+            for slot, gpu_index in enumerate(gpu_list)
+        ]
         pending_jobs = list(jobs_to_run)
         batch_logger.log(f"Dispatching {len(pending_jobs)} job(s) across {len(workers)} worker(s).")
         try:
-            while pending_jobs or any(worker.current_job is not None for worker in workers):
+            while pending_jobs or any(worker.current_job is not None or worker.queued_job is not None for worker in workers):
                 if not abort_requested:
                     for index, worker in enumerate(workers):
-                        if worker.current_job is not None or not pending_jobs:
+                        if worker.current_job is None:
+                            if not worker.process.is_alive():
+                                if worker.queued_job is not None:
+                                    pending_jobs.insert(0, worker.queued_job)
+                                    worker.queued_job = None
+                                workers[index] = worker = _restart_worker(ctx, worker, result_queue, log_path, echo, enable_prefetch)
+                            if not pending_jobs:
+                                continue
+                            job = pending_jobs.pop(0)
+                            _start_job_on_worker(worker, job, enqueue=True)
                             continue
-                        if not worker.process.is_alive():
-                            workers[index] = worker = _restart_worker(ctx, worker, result_queue, log_path, echo)
-                        job = pending_jobs.pop(0)
-                        started_at = _utc_now()
-                        _upsert_status(
-                            conn,
-                            mesh_id=job.mesh_id,
-                            input_path=job.input_path,
-                            status="running",
-                            output_dir=job.output_dir,
-                            started_at=started_at,
-                            finished_at=None,
-                            error_type=None,
-                            error_message=None,
-                            worker_id=f"worker-{worker.slot}-gpu{worker.gpu_index}",
-                            gpu_index=worker.gpu_index,
-                            increment_attempt=True,
-                        )
-                        _record_event(events_path, "job_started", mesh_id=job.mesh_id, row_index=job.row_index, gpu_index=worker.gpu_index, worker_id=f"worker-{worker.slot}-gpu{worker.gpu_index}", output_dir=job.output_dir)
-                        worker.job_queue.put(job)
-                        worker.current_job = job
-                        worker.current_started_at = started_at
-                        worker.current_started_mono = time.monotonic()
+                        if enable_prefetch and worker.queued_job is None and pending_jobs:
+                            queued_job = pending_jobs.pop(0)
+                            worker.job_queue.put(queued_job)
+                            worker.queued_job = queued_job
                 try:
                     result = result_queue.get(timeout=0.2)
                 except queue_module.Empty:
                     result = None
                 if result is not None:
                     worker = workers[result["worker_slot"]]
-                    if worker.current_job is not None and worker.current_job.mesh_id == result["mesh_id"]:
-                        worker.current_job = None
-                        worker.current_started_at = None
-                        worker.current_started_mono = None
                     _finalize_job_result(conn, events_path, result)
                     if result["status"] == "success":
                         success_count += 1
@@ -1543,10 +1738,24 @@ def main() -> None:
                         _progress("failed", result["mesh_id"], last_ms=float(result["duration_ms"]))
                     if result["status"] == "failed" and (args.fail_fast or (args.max_failures is not None and failed_count >= args.max_failures)):
                         abort_requested = True
+                    if worker.current_job is not None and worker.current_job.mesh_id == result["mesh_id"]:
+                        if not abort_requested and worker.queued_job is not None:
+                            next_job = worker.queued_job
+                            worker.queued_job = None
+                            _start_job_on_worker(worker, next_job, enqueue=False)
+                        else:
+                            worker.current_job = None
+                            worker.current_started_at = None
+                            worker.current_started_mono = None
+                            if abort_requested:
+                                worker.queued_job = None
                 for index, worker in enumerate(workers):
                     if worker.current_job is None:
+                        if worker.queued_job is not None and not worker.process.is_alive():
+                            pending_jobs.insert(0, worker.queued_job)
+                            worker.queued_job = None
                         if not worker.process.is_alive():
-                            workers[index] = _restart_worker(ctx, worker, result_queue, log_path, echo)
+                            workers[index] = _restart_worker(ctx, worker, result_queue, log_path, echo, enable_prefetch)
                         continue
                     if not worker.process.is_alive():
                         duration_ms = 0.0
@@ -1558,7 +1767,13 @@ def main() -> None:
                         batch_logger.log(f"Worker exited unexpectedly for mesh_id={result['mesh_id']}; restarting worker.")
                         processed_count += 1
                         _progress("failed", f"{result['mesh_id']} worker-exit", last_ms=float(result["duration_ms"]))
-                        workers[index] = _restart_worker(ctx, worker, result_queue, log_path, echo)
+                        if worker.queued_job is not None:
+                            pending_jobs.insert(0, worker.queued_job)
+                            worker.queued_job = None
+                        worker.current_job = None
+                        worker.current_started_at = None
+                        worker.current_started_mono = None
+                        workers[index] = _restart_worker(ctx, worker, result_queue, log_path, echo, enable_prefetch)
                         if args.fail_fast or (args.max_failures is not None and failed_count >= args.max_failures):
                             abort_requested = True
                             break
@@ -1580,7 +1795,13 @@ def main() -> None:
                             batch_logger.log(f"Timed out mesh_id={result['mesh_id']} after {args.mesh_timeout_sec} sec; restarting worker.")
                             processed_count += 1
                             _progress("failed", f"{result['mesh_id']} timeout", last_ms=float(result["duration_ms"]))
-                            workers[index] = _start_worker(ctx, worker.slot, worker.gpu_index, result_queue, log_path, echo)
+                            if worker.queued_job is not None:
+                                pending_jobs.insert(0, worker.queued_job)
+                                worker.queued_job = None
+                            worker.current_job = None
+                            worker.current_started_at = None
+                            worker.current_started_mono = None
+                            workers[index] = _start_worker(ctx, worker.slot, worker.gpu_index, result_queue, log_path, echo, enable_prefetch)
                             if args.fail_fast or (args.max_failures is not None and failed_count >= args.max_failures):
                                 abort_requested = True
                                 break
@@ -1602,6 +1823,7 @@ def main() -> None:
                             failed_count += 1
                             processed_count += 1
                             _progress("failed", f"{result['mesh_id']} aborted", last_ms=float(result["duration_ms"]))
+                        worker.queued_job = None
                         _stop_worker(worker)
                     break
         finally:
@@ -1648,6 +1870,7 @@ def main() -> None:
         "aggregate_render_ms": _round(aggregate_render_ms),
         "aggregate_save_ms": _round(aggregate_save_ms),
         "gpu_list": gpu_list,
+        "enable_prefetch": enable_prefetch,
     }
     _write_json(summary_path, summary)
     _record_event(

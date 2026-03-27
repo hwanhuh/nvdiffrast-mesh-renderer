@@ -118,6 +118,13 @@ class RenderAllBatchConfigTests(unittest.TestCase):
 
         self.assertEqual(config.png_compression, 2)
 
+    def test_config_parses_texture_map_max_size(self):
+        parser = build_argparser()
+        args = parser.parse_args(["example.glb", "--texture-map-max-size", "2048"])
+        config = config_from_args(args)
+
+        self.assertEqual(config.texture_map_max_size, 2048)
+
 
 if __name__ == "__main__":
     unittest.main()

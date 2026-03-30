@@ -2,20 +2,15 @@ import pathlib
 import math
 import random
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Iterator, List, Sequence, Tuple
 
 import numpy as np
 import torch
 import trimesh
+from trimesh.visual import material as trimesh_material
 
 from .config import RenderConfig
-from .geometry_utils import (
-    compute_face_normals,
-    compute_face_normals_torch,
-    compute_vertex_tangents,
-    compute_vertex_tangents_torch,
-    scene_bounds,
-)
+from .geometry_utils import scene_bounds
 from .materials import GltfMaterialOverrides, MaterialExtractor, load_gltf_material_overrides, resize_scene_material_textures
 from .math_utils import look_at, orbit_camera, orthographic, perspective, safe_normalize, safe_normalize_np
 from .textures import TextureCache
@@ -27,74 +22,131 @@ class PreloadedSceneAsset:
     path: pathlib.Path
     scene: trimesh.Scene
     overrides: dict[str, GltfMaterialOverrides]
+    texture_map_max_size: int
+
+
+@dataclass(frozen=True)
+class PreloadedMeshEntry:
+    name: str
+    mesh: trimesh.Trimesh
+    transform: np.ndarray
+    override: GltfMaterialOverrides
+
+
+@dataclass(frozen=True)
+class PreloadedSceneSummary:
+    mesh_count: int
+    pbr_count: int
+    vertex_count: int
+    face_count: int
 
 
 def preload_scene_asset(path: pathlib.Path, texture_map_max_size: int = 0) -> PreloadedSceneAsset:
+    texture_map_max_size = max(int(texture_map_max_size), 0)
     overrides = load_gltf_material_overrides(path)
     scene_or_mesh = trimesh.load(path, force="scene", process=False)
     scene = scene_or_mesh if isinstance(scene_or_mesh, trimesh.Scene) else trimesh.Scene(scene_or_mesh)
-    resize_scene_material_textures(scene, max(int(texture_map_max_size), 0))
-    return PreloadedSceneAsset(path=path, scene=scene, overrides=overrides)
+    resize_scene_material_textures(scene, texture_map_max_size)
+    return PreloadedSceneAsset(
+        path=path,
+        scene=scene,
+        overrides=overrides,
+        texture_map_max_size=texture_map_max_size,
+    )
 
 
 class SceneBuilder:
-    def __init__(self, cache: TextureCache, device: torch.device):
+    def __init__(self, cache: TextureCache, device: torch.device, *, texture_map_max_size: int = 0):
         self.cache = cache
         self.device = device
         self.materials = MaterialExtractor(cache=cache, device=device)
-        self._geometry_preprocess_device = "auto"
-        self._geometry_cuda_threshold_faces = 100000
-        self._geometry_cuda_threshold_vertices = 100000
-        self._texture_map_max_size = 0
+        self._texture_map_max_size = max(int(texture_map_max_size), 0)
 
     def load_meshes(self, path: pathlib.Path) -> List[MeshData]:
         return self.load_meshes_from_preloaded(preload_scene_asset(path, self._texture_map_max_size))
 
     def load_meshes_from_preloaded(self, preloaded: PreloadedSceneAsset) -> List[MeshData]:
-        scene = preloaded.scene
-        overrides = preloaded.overrides
-        meshes = []
+        return [self.load_mesh_from_entry(entry) for entry in self.iter_preloaded_mesh_entries(preloaded)]
+
+    def iter_preloaded_mesh_entries(self, preloaded: PreloadedSceneAsset) -> Iterator[PreloadedMeshEntry]:
         used_names = {}
         used_name_counts = {}
-        for index, (mesh_name, mesh, transform) in enumerate(self._iter_scene_meshes(scene)):
+        for index, (mesh_name, mesh, transform) in enumerate(self._iter_scene_meshes(preloaded.scene)):
             if not isinstance(mesh, trimesh.Trimesh) or mesh.faces is None or len(mesh.faces) == 0:
                 continue
-            vertices = np.asarray(mesh.vertices, dtype=np.float32)
-            faces = np.asarray(mesh.faces, dtype=np.int32)
-            normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
-            uv = getattr(mesh.visual, "uv", None)
-            uv = np.asarray(uv, dtype=np.float32) if uv is not None and len(uv) == len(vertices) else None
-            vertices, normals = self._apply_transform(vertices, normals, transform)
-            material, vertex_colors = self.materials.extract(mesh, overrides.get(mesh_name))
-            use_cuda_preprocess = self._should_preprocess_on_cuda(vertices, faces)
-            positions = torch.as_tensor(vertices, dtype=torch.float32, device=self.device).contiguous()
-            positions_h = torch.cat([positions, torch.ones_like(positions[:, :1])], dim=-1).contiguous()
-            faces_t = torch.as_tensor(faces, dtype=torch.int32, device=self.device).contiguous()
-            normals_t = torch.as_tensor(normals, dtype=torch.float32, device=self.device).contiguous()
-            uv_t = None if uv is None else torch.as_tensor(uv, dtype=torch.float32, device=self.device).contiguous()
-            if use_cuda_preprocess:
-                face_normals = compute_face_normals_torch(positions, faces_t)
-                tangents = compute_vertex_tangents_torch(positions, faces_t, uv_t, normals_t) if uv_t is not None else None
-            else:
-                tangents_np = compute_vertex_tangents(vertices, faces, uv, normals) if uv is not None else None
-                face_normals = torch.as_tensor(compute_face_normals(vertices, faces), dtype=torch.float32, device=self.device).contiguous()
-                tangents = None if tangents_np is None else torch.as_tensor(tangents_np, dtype=torch.float32, device=self.device).contiguous()
             instance_name = trimesh.util.unique_name(mesh_name or f"mesh_{index}", used_names, counts=used_name_counts)
-            meshes.append(
-                MeshData(
-                    name=instance_name,
-                    positions=positions,
-                    positions_h=positions_h,
-                    faces=faces_t,
-                    face_normals=face_normals.contiguous(),
-                    normals=normals_t,
-                    uv=uv_t,
-                    tangents=None if tangents is None else tangents.contiguous(),
-                    vertex_colors=None if vertex_colors is None else vertex_colors.contiguous(),
-                    material=material,
-                )
+            yield PreloadedMeshEntry(
+                name=instance_name,
+                mesh=mesh,
+                transform=np.asarray(transform, dtype=np.float32),
+                override=preloaded.overrides.get(mesh_name, GltfMaterialOverrides()),
             )
-        return meshes
+
+    def load_mesh_from_entry(self, entry: PreloadedMeshEntry) -> MeshData:
+        mesh = entry.mesh
+        vertices = np.asarray(mesh.vertices, dtype=np.float32)
+        faces = np.asarray(mesh.faces, dtype=np.int32)
+        normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
+        uv = getattr(mesh.visual, "uv", None)
+        uv = np.asarray(uv, dtype=np.float32) if uv is not None and len(uv) == len(vertices) else None
+        vertices, normals = self._apply_transform(vertices, normals, entry.transform)
+        material, vertex_colors = self.materials.extract(mesh, entry.override)
+        positions = torch.as_tensor(vertices, dtype=torch.float32, device=self.device).contiguous()
+        faces_t = torch.as_tensor(faces, dtype=torch.int32, device=self.device).contiguous()
+        normals_t = torch.as_tensor(normals, dtype=torch.float32, device=self.device).contiguous()
+        uv_t = None if uv is None else torch.as_tensor(uv, dtype=torch.float32, device=self.device).contiguous()
+        return MeshData(
+            name=entry.name,
+            positions=positions,
+            faces=faces_t,
+            normals=normals_t,
+            uv=uv_t,
+            tangents=None,
+            vertex_colors=None if vertex_colors is None else vertex_colors.contiguous(),
+            material=material,
+        )
+
+    def summarize_preloaded(self, preloaded: PreloadedSceneAsset) -> PreloadedSceneSummary:
+        mesh_count = 0
+        pbr_count = 0
+        vertex_count = 0
+        face_count = 0
+        for entry in self.iter_preloaded_mesh_entries(preloaded):
+            mesh_count += 1
+            vertex_count += int(len(entry.mesh.vertices))
+            face_count += int(len(entry.mesh.faces))
+            if self._workflow_for_material(getattr(getattr(entry.mesh, "visual", None), "material", None)) == "pbr":
+                pbr_count += 1
+        return PreloadedSceneSummary(
+            mesh_count=mesh_count,
+            pbr_count=pbr_count,
+            vertex_count=vertex_count,
+            face_count=face_count,
+        )
+
+    def bounds_from_preloaded(self, preloaded: PreloadedSceneAsset) -> tuple[np.ndarray, float]:
+        bounds_min = None
+        bounds_max = None
+        for entry in self.iter_preloaded_mesh_entries(preloaded):
+            vertices = np.asarray(entry.mesh.vertices, dtype=np.float32)
+            if vertices.size == 0:
+                continue
+            transformed = self._apply_vertex_transform(vertices, entry.transform)
+            current_min = transformed.min(axis=0)
+            current_max = transformed.max(axis=0)
+            bounds_min = current_min if bounds_min is None else np.minimum(bounds_min, current_min)
+            bounds_max = current_max if bounds_max is None else np.maximum(bounds_max, current_max)
+        if bounds_min is None or bounds_max is None:
+            return np.zeros(3, dtype=np.float32), 1e-3
+        center = ((bounds_min + bounds_max) * 0.5).astype(np.float32)
+        radius = 1e-3
+        for entry in self.iter_preloaded_mesh_entries(preloaded):
+            vertices = np.asarray(entry.mesh.vertices, dtype=np.float32)
+            if vertices.size == 0:
+                continue
+            transformed = self._apply_vertex_transform(vertices, entry.transform)
+            radius = max(radius, float(np.linalg.norm(transformed - center, axis=-1).max(initial=0.0)))
+        return center, max(radius, 1e-3)
 
     def build_camera(self, meshes: Sequence[MeshData], config: RenderConfig) -> CameraData:
         center, radius = scene_bounds(meshes)
@@ -229,28 +281,36 @@ class SceneBuilder:
         transformed_normals = safe_normalize_np(normals @ normal_matrix.T)
         return transformed_vertices.astype(np.float32, copy=False), transformed_normals.astype(np.float32, copy=False)
 
-    def _should_preprocess_on_cuda(self, vertices: np.ndarray, faces: np.ndarray) -> bool:
-        if self.device.type != "cuda":
-            return False
-        if self._geometry_preprocess_device == "cpu":
-            return False
-        if self._geometry_preprocess_device == "cuda":
-            return True
-        return len(faces) >= self._geometry_cuda_threshold_faces or len(vertices) >= self._geometry_cuda_threshold_vertices
+    def _apply_vertex_transform(self, vertices: np.ndarray, transform: np.ndarray) -> np.ndarray:
+        if np.allclose(transform, np.eye(4, dtype=np.float32), atol=1e-8):
+            return vertices.astype(np.float32, copy=False)
+        linear = np.asarray(transform[:3, :3], dtype=np.float32)
+        translate = np.asarray(transform[:3, 3], dtype=np.float32)
+        return (vertices @ linear.T + translate).astype(np.float32, copy=False)
 
-    def configure_geometry_preprocess(self, config: RenderConfig) -> None:
-        self._geometry_preprocess_device = config.geometry_preprocess_device
-        self._geometry_cuda_threshold_faces = config.geometry_cuda_threshold_faces
-        self._geometry_cuda_threshold_vertices = config.geometry_cuda_threshold_vertices
-        self._texture_map_max_size = config.texture_map_max_size
+    def _workflow_for_material(self, material) -> str:
+        if isinstance(material, trimesh_material.PBRMaterial):
+            has_pbr_signals = any(
+                [
+                    material.metallicFactor is not None,
+                    material.roughnessFactor is not None,
+                    material.metallicRoughnessTexture is not None,
+                    material.normalTexture is not None,
+                    material.occlusionTexture is not None,
+                    material.emissiveTexture is not None,
+                    material.emissiveFactor is not None,
+                ]
+            )
+            return "pbr" if has_pbr_signals else "diffuse"
+        return "diffuse"
 
     def _clip_planes_from_meshes(self, meshes: Sequence[MeshData], view: np.ndarray) -> tuple[float, float]:
         view_t = torch.as_tensor(view, dtype=torch.float32, device=self.device)
         positive_depth_min = None
         positive_depth_max = None
         for mesh in meshes:
-            view_pos = torch.matmul(mesh.positions_h, view_t.t())[:, 2]
-            depth = -view_pos
+            view_pos = torch.matmul(mesh.positions, view_t[:3, :3].t()) + view_t[:3, 3]
+            depth = -view_pos[:, 2]
             visible_depth = depth[depth > 0.0]
             if visible_depth.numel() == 0:
                 continue

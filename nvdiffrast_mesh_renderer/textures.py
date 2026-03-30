@@ -54,7 +54,7 @@ def mip_level_count(height: int, width: int) -> int:
     return levels
 
 
-def make_gpu_texture(array: np.ndarray, device: torch.device, srgb: bool) -> GpuTexture:
+def make_gpu_texture(array: np.ndarray, device: torch.device, srgb: bool, *, build_mipmaps: bool = True) -> GpuTexture:
     array = array[..., None] if array.ndim == 2 else array
     tensor = torch.from_numpy(np.ascontiguousarray(array)).to(device, dtype=torch.float32)
     tensor = torch.flip(tensor, dims=(0,))
@@ -62,16 +62,17 @@ def make_gpu_texture(array: np.ndarray, device: torch.device, srgb: bool) -> Gpu
         rgb = srgb_to_linear(tensor[..., :3])
         tensor = torch.cat([rgb, tensor[..., 3:]], dim=-1) if tensor.shape[-1] > 3 else rgb
     tensor = tensor.unsqueeze(0).contiguous()
-    max_mip_level = mip_level_count(tensor.shape[1], tensor.shape[2])
+    max_mip_level = mip_level_count(tensor.shape[1], tensor.shape[2]) if build_mipmaps else 0
     mip = dr.texture_construct_mip(tensor, max_mip_level=max_mip_level) if max_mip_level > 0 else None
     return GpuTexture(tex=tensor, mip=mip, can_mip=max_mip_level > 0, max_mip_level=max_mip_level or None)
 
 
 class TextureCache:
-    def __init__(self, device: torch.device, *, max_file_entries: int = 0):
+    def __init__(self, device: torch.device, *, max_file_entries: int = 0, build_mipmaps: bool = True):
         self.device = device
         self._cache: dict[tuple[str, int, bool, object], tuple[weakref.ReferenceType[object], GpuTexture]] = {}
         self._max_file_entries = max(int(max_file_entries), 0)
+        self._build_mipmaps = bool(build_mipmaps)
         self._file_cache: OrderedDict[tuple[str, str, bool, object, tuple[int, int, int, int]], GpuTexture] = OrderedDict()
 
     def _cache_key(self, kind: str, source: object, srgb: bool, variant: object) -> tuple[str, int, bool, object]:
@@ -94,8 +95,15 @@ class TextureCache:
         self._cache[key] = (weakref.ref(source, _remove), texture)
         return texture
 
+    def set_build_mipmaps(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._build_mipmaps == enabled:
+            return
+        self._build_mipmaps = enabled
+        self.clear()
+
     def _make_texture(self, array: np.ndarray, srgb: bool) -> GpuTexture:
-        return make_gpu_texture(array, self.device, srgb=srgb)
+        return make_gpu_texture(array, self.device, srgb=srgb, build_mipmaps=self._build_mipmaps)
 
     def _file_signature(self, path: pathlib.Path) -> tuple[pathlib.Path, tuple[int, int, int, int]]:
         resolved = path.expanduser().resolve()

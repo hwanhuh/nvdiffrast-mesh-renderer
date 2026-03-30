@@ -30,7 +30,13 @@ ENV_USAGE_CHOICES = ("light", "background", "both")
 TONEMAP_CHOICES = ("aces", "reinhard", "none")
 CULL_MODE_CHOICES = ("auto", "off", "force")
 CAMERA_CHOICES = ("perspective", "orthographic")
-GEOMETRY_PREPROCESS_DEVICE_CHOICES = ("auto", "cpu", "cuda")
+LEGACY_IGNORED_OVERRIDE_KEYS = frozenset(
+    {
+        "geometry_preprocess_device",
+        "geometry_cuda_threshold_faces",
+        "geometry_cuda_threshold_vertices",
+    }
+)
 
 BATCH_OVERRIDE_KEYS = frozenset(
     {
@@ -56,9 +62,6 @@ BATCH_OVERRIDE_KEYS = frozenset(
         "wireframe_opacity",
         "wireframe_thickness_px",
         "double_sided_depth_peels",
-        "geometry_preprocess_device",
-        "geometry_cuda_threshold_faces",
-        "geometry_cuda_threshold_vertices",
         "texture_map_max_size",
     }
 )
@@ -109,9 +112,6 @@ class RenderConfig:
     canonical_mv_conditions: bool
     canonical_render_cond: bool
     multi_view_chunk_size: int
-    geometry_preprocess_device: str
-    geometry_cuda_threshold_faces: int
-    geometry_cuda_threshold_vertices: int
     texture_map_max_size: int
     benchmark_requested: bool
     benchmark_runs: int
@@ -292,24 +292,6 @@ def add_render_arguments(
     if include_multi_view_chunk_size:
         parser.add_argument("--multi-view-chunk-size", type=int, default=4, help="Maximum number of views to stage per sequential multi-view chunk")
     parser.add_argument(
-        "--geometry-preprocess-device",
-        choices=GEOMETRY_PREPROCESS_DEVICE_CHOICES,
-        default="auto",
-        help="Where to compute face normals and tangents during mesh loading. auto uses CUDA only for large meshes.",
-    )
-    parser.add_argument(
-        "--geometry-cuda-threshold-faces",
-        type=int,
-        default=100000,
-        help="In auto mode, use CUDA preprocessing when a mesh has at least this many faces.",
-    )
-    parser.add_argument(
-        "--geometry-cuda-threshold-vertices",
-        type=int,
-        default=100000,
-        help="In auto mode, use CUDA preprocessing when a mesh has at least this many vertices.",
-    )
-    parser.add_argument(
         "--texture-map-max-size",
         type=int,
         default=2048,
@@ -388,9 +370,6 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         canonical_mv_conditions=bool(getattr(args, "canonical_mv_conditions", False)),
         canonical_render_cond=bool(getattr(args, "canonical_render_cond", False)),
         multi_view_chunk_size=max(int(getattr(args, "multi_view_chunk_size", 4)), 1),
-        geometry_preprocess_device=str(getattr(args, "geometry_preprocess_device", "auto")),
-        geometry_cuda_threshold_faces=max(int(getattr(args, "geometry_cuda_threshold_faces", 100000)), 0),
-        geometry_cuda_threshold_vertices=max(int(getattr(args, "geometry_cuda_threshold_vertices", 100000)), 0),
         texture_map_max_size=max(int(getattr(args, "texture_map_max_size", 0)), 0),
         benchmark_requested=benchmark_requested,
         benchmark_runs=benchmark_runs,
@@ -399,7 +378,7 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
 
 
 def config_with_overrides(base_config: RenderConfig, overrides: dict[str, Any]) -> RenderConfig:
-    unknown_keys = sorted(set(overrides) - BATCH_OVERRIDE_KEYS)
+    unknown_keys = sorted(set(overrides) - BATCH_OVERRIDE_KEYS - LEGACY_IGNORED_OVERRIDE_KEYS)
     if unknown_keys:
         joined = ", ".join(unknown_keys)
         raise ValueError(f"Unsupported override key(s): {joined}")
@@ -439,10 +418,9 @@ def config_with_overrides(base_config: RenderConfig, overrides: dict[str, Any]) 
         if key == "cull_mode":
             updates[key] = _validate_choice(key, str(value), CULL_MODE_CHOICES)
             continue
-        if key == "geometry_preprocess_device":
-            updates[key] = _validate_choice(key, str(value), GEOMETRY_PREPROCESS_DEVICE_CHOICES)
+        if key in LEGACY_IGNORED_OVERRIDE_KEYS:
             continue
-        if key in {"resolution", "env_diffuse_samples", "geometry_cuda_threshold_faces", "geometry_cuda_threshold_vertices", "texture_map_max_size"}:
+        if key in {"resolution", "env_diffuse_samples", "texture_map_max_size"}:
             updates[key] = int(value)
             continue
         if key == "png_compression":

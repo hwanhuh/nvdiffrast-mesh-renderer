@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # `pip install <clone_dir> --no-build-isolation`; see `scripts/install_nvdiffrast.sh`.
 [project]
 name = "nvdiffrast_mesh_renderer"
-version = "0.1.2"
+version = "0.1.3"
 description = "CUDA + nvdiffrast based GLB/GLTF mesh renderer"
 authors = [
     { name = "Hwan Heo", email = "gjghks950@naver.com" },

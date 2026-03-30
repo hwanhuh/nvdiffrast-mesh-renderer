@@ -3,6 +3,7 @@ import csv
 import hashlib
 import json
 import multiprocessing as mp
+import os
 import pathlib
 import queue as queue_module
 import shutil
@@ -369,6 +370,41 @@ def _parse_view_chunk_sizes(value: str) -> tuple[int, ...]:
     if any(left <= right for left, right in zip(sizes, sizes[1:])):
         raise ValueError("--view-chunk-sizes must be strictly descending")
     return sizes
+
+
+def _texture_map_retry_sizes(initial_size: int) -> tuple[int, ...]:
+    size = max(int(initial_size), 0)
+    sizes = [size]
+    for candidate in (1024, 512):
+        if size == 0 or candidate < size:
+            if candidate not in sizes:
+                sizes.append(candidate)
+    return tuple(sizes)
+
+
+def _streaming_texture_map_size(initial_size: int) -> int:
+    size = max(int(initial_size), 0)
+    stream_texture_max_size = max(int(os.environ.get("NVDIFFRAST_STREAM_TEXTURE_MAX_SIZE", "1024")), 1)
+    if size == 0 or size > stream_texture_max_size:
+        return stream_texture_max_size
+    return size
+
+
+def _streaming_render_config(config: RenderConfig, texture_map_max_size: int) -> RenderConfig:
+    return replace(
+        config,
+        texture_map_max_size=_streaming_texture_map_size(texture_map_max_size),
+        antialias=False,
+        double_sided_depth_peels=1,
+    )
+
+
+def _detached_exception(exc: BaseException) -> BaseException:
+    exc_type = type(exc)
+    try:
+        return exc_type(str(exc))
+    except Exception:
+        return RuntimeError(f"{exc_type.__name__}: {exc}")
 
 
 def _axis_values(start: float | None, end: float | None, step: float | None, single: float) -> list[float]:
@@ -762,7 +798,7 @@ def _build_camera_entry(
 
 def _render_chunk_arrays(renderer: SceneRenderer, prepared_rows: list[tuple[Any, ...]]) -> list[Any]:
     # One nvdiffrast CUDA context is owned by one worker and used sequentially.
-    return [renderer.render_prepared(prepared) for _view, _view_config, prepared, _image_name in prepared_rows]
+    return renderer.render_prepared_batch([prepared for _view, _view_config, prepared, _image_name in prepared_rows])
 
 
 def _run_render_attempt(job: JobSpec, renderer: SceneRenderer, assets: Any, chunk_size: int) -> tuple[list[dict[str, Any]], float, float, float]:
@@ -1015,6 +1051,7 @@ def _execute_job(
     worker_id = f"worker-{worker_slot}-gpu{gpu_index}"
     output_dir = pathlib.Path(job.output_dir)
     temp_output_dir = pathlib.Path(job.temp_output_dir)
+    input_path = pathlib.Path(job.input_path)
     started_at = _utc_now()
     overall_start = time.perf_counter()
     session_init_ms = 0.0
@@ -1027,6 +1064,9 @@ def _execute_job(
     view_chunk_size_used: int | None = None
     renderer: SceneRenderer | None = None
     assets: Any | None = None
+    last_exc: BaseException | None = None
+    cameras: list[dict[str, Any]] | None = None
+    texture_retry_sizes = _texture_map_retry_sizes(job.render_config.texture_map_max_size)
     try:
         logger.log(f"Started job {job.mesh_id} with {len(job.views)} view(s) -> {job.output_dir}")
         if temp_output_dir.exists():
@@ -1034,49 +1074,170 @@ def _execute_job(
         if output_dir.exists() and job.overwrite in {"all", "failed"}:
             _remove_path(output_dir)
         output_dir.parent.mkdir(parents=True, exist_ok=True)
-        renderer_cache.clear_texture_caches()
-        init_start = time.perf_counter()
-        renderer, created = renderer_cache.get_with_status(job.render_config)
-        if created:
-            session_init_ms += (time.perf_counter() - init_start) * 1000.0
-        prepare_start = time.perf_counter()
-        assets = renderer.prepare_assets(pathlib.Path(job.input_path), preloaded_scene=preloaded_scene)
-        prepare_assets_ms = (time.perf_counter() - prepare_start) * 1000.0
-        last_exc: BaseException | None = None
-        cameras: list[dict[str, Any]] | None = None
-        for chunk_size in job.view_chunk_sizes:
-            attempted_chunk_sizes.append(chunk_size)
-            if temp_output_dir.exists():
-                _remove_path(temp_output_dir)
-            temp_output_dir.mkdir(parents=True, exist_ok=True)
+        for texture_index, texture_map_max_size in enumerate(texture_retry_sizes):
+            active_config = (
+                job.render_config
+                if texture_map_max_size == job.render_config.texture_map_max_size
+                else replace(job.render_config, texture_map_max_size=texture_map_max_size)
+            )
+            active_preloaded_scene = preloaded_scene
+            if texture_index > 0:
+                logger.log(
+                    f"Job {job.mesh_id} retrying with texture_map_max_size={texture_map_max_size}."
+                )
+                renderer_cache.reset_after_cuda_failure(active_config)
+            if active_preloaded_scene is None or texture_index > 0:
+                active_preloaded_scene = preload_scene_asset(input_path, texture_map_max_size=texture_map_max_size)
+            renderer_cache.clear_texture_caches()
+            renderer = None
+            assets = None
+            texture_last_exc: BaseException | None = None
+            should_retry_texture = False
             try:
-                attempt_cameras, attempt_prepare_views_ms, attempt_render_ms, attempt_save_ms = _run_render_attempt(job, renderer, assets, chunk_size)
-                cameras = attempt_cameras
-                prepare_views_ms_total = attempt_prepare_views_ms
-                render_ms_total = attempt_render_ms
-                save_ms_total = attempt_save_ms
-                view_chunk_size_used = chunk_size
-                break
-            except Exception as exc:
-                last_exc = exc
-                if is_cuda_oom(exc) and chunk_size != job.view_chunk_sizes[-1]:
-                    oom_retries += 1
-                    next_chunk_size = job.view_chunk_sizes[job.view_chunk_sizes.index(chunk_size) + 1]
-                    logger.log(
-                        f"Job {job.mesh_id} hit CUDA OOM at chunk size {chunk_size}; "
-                        f"recreating renderer and retrying with chunk size {next_chunk_size}."
-                    )
-                    renderer = None
-                    renderer_cache.reset_after_cuda_failure(job.render_config)
-                    init_start = time.perf_counter()
-                    renderer, created = renderer_cache.get_with_status(job.render_config)
-                    if created:
-                        session_init_ms += (time.perf_counter() - init_start) * 1000.0
+                init_start = time.perf_counter()
+                renderer, created = renderer_cache.get_with_status(active_config)
+                if created:
+                    session_init_ms += (time.perf_counter() - init_start) * 1000.0
+                auto_streaming = (
+                    active_preloaded_scene is not None
+                    and renderer.should_stream_preloaded_scene(active_preloaded_scene)
+                )
+                streaming_attempts = (True,) if auto_streaming or active_preloaded_scene is None else (False, True)
+                renderer_config_in_use = active_config
+                for streaming_index, force_streaming in enumerate(streaming_attempts):
+                    attempt_preloaded_scene = active_preloaded_scene
+                    attempt_config = active_config
+                    if attempt_preloaded_scene is not None and force_streaming:
+                        attempt_config = _streaming_render_config(active_config, texture_map_max_size)
+                        if attempt_preloaded_scene.texture_map_max_size != attempt_config.texture_map_max_size:
+                            attempt_preloaded_scene = preload_scene_asset(
+                                input_path,
+                                texture_map_max_size=attempt_config.texture_map_max_size,
+                            )
+                    if streaming_index > 0:
+                        logger.log(
+                            f"Job {job.mesh_id} exhausted fast-path retries at texture_map_max_size={texture_map_max_size}; "
+                            f"retrying in streaming mode before reducing textures."
+                        )
+                        renderer = None
+                        assets = None
+                        renderer_cache.reset_after_cuda_failure(renderer_config_in_use)
+                        renderer_config_in_use = attempt_config
+                    if renderer is None or renderer_config_in_use != attempt_config:
+                        init_start = time.perf_counter()
+                        renderer, created = renderer_cache.get_with_status(attempt_config)
+                        if created:
+                            session_init_ms += (time.perf_counter() - init_start) * 1000.0
+                        renderer_config_in_use = attempt_config
+                    try:
+                        prepare_start = time.perf_counter()
+                        assets = renderer.prepare_assets(
+                            input_path,
+                            preloaded_scene=attempt_preloaded_scene,
+                            force_streaming=force_streaming,
+                        )
+                        prepare_assets_ms += (time.perf_counter() - prepare_start) * 1000.0
+                        should_retry_streaming = False
+                        for chunk_size in job.view_chunk_sizes:
+                            attempted_chunk_sizes.append(chunk_size)
+                            if temp_output_dir.exists():
+                                _remove_path(temp_output_dir)
+                            temp_output_dir.mkdir(parents=True, exist_ok=True)
+                            try:
+                                attempt_cameras, attempt_prepare_views_ms, attempt_render_ms, attempt_save_ms = _run_render_attempt(job, renderer, assets, chunk_size)
+                                cameras = attempt_cameras
+                                prepare_views_ms_total = attempt_prepare_views_ms
+                                render_ms_total = attempt_render_ms
+                                save_ms_total = attempt_save_ms
+                                view_chunk_size_used = chunk_size
+                                break
+                            except Exception as exc:
+                                detached_exc = _detached_exception(exc)
+                                texture_last_exc = detached_exc
+                                if is_cuda_oom(exc) and chunk_size != job.view_chunk_sizes[-1]:
+                                    oom_retries += 1
+                                    next_chunk_size = job.view_chunk_sizes[job.view_chunk_sizes.index(chunk_size) + 1]
+                                    logger.log(
+                                        f"Job {job.mesh_id} hit CUDA OOM at chunk size {chunk_size}; "
+                                        f"recreating renderer and retrying with chunk size {next_chunk_size}."
+                                    )
+                                    renderer = None
+                                    renderer_cache.reset_after_cuda_failure(attempt_config)
+                                    init_start = time.perf_counter()
+                                    renderer, created = renderer_cache.get_with_status(attempt_config)
+                                    if created:
+                                        session_init_ms += (time.perf_counter() - init_start) * 1000.0
+                                    renderer_config_in_use = attempt_config
+                                    continue
+                                if is_cuda_oom(exc) and force_streaming is False and streaming_index + 1 < len(streaming_attempts):
+                                    should_retry_streaming = True
+                                    renderer = None
+                                    assets = None
+                                    renderer_cache.reset_after_cuda_failure(attempt_config)
+                                    break
+                                if is_cuda_oom(exc) and texture_index + 1 < len(texture_retry_sizes):
+                                    should_retry_texture = True
+                                    next_texture_map_size = texture_retry_sizes[texture_index + 1]
+                                    logger.log(
+                                        f"Job {job.mesh_id} exhausted chunk fallback at texture_map_max_size={texture_map_max_size}; "
+                                        f"retrying with texture_map_max_size={next_texture_map_size}."
+                                    )
+                                    renderer = None
+                                    assets = None
+                                    renderer_cache.reset_after_cuda_failure(attempt_config)
+                                    break
+                                if is_cuda_failure(exc):
+                                    renderer = None
+                                    assets = None
+                                    renderer_cache.reset_after_cuda_failure(attempt_config)
+                                raise detached_exc
+                        if cameras is not None:
+                            break
+                        if should_retry_streaming:
+                            continue
+                        if should_retry_texture:
+                            break
+                    except Exception as exc:
+                        detached_exc = _detached_exception(exc)
+                        texture_last_exc = detached_exc
+                        if is_cuda_oom(exc) and force_streaming is False and streaming_index + 1 < len(streaming_attempts):
+                            logger.log(
+                                f"Job {job.mesh_id} hit CUDA OOM while preparing fast-path assets at "
+                                f"texture_map_max_size={texture_map_max_size}; retrying in streaming mode."
+                            )
+                            renderer = None
+                            assets = None
+                            renderer_cache.reset_after_cuda_failure(attempt_config)
+                            break
+                        if is_cuda_oom(exc) and texture_index + 1 < len(texture_retry_sizes):
+                            should_retry_texture = True
+                            next_texture_map_size = texture_retry_sizes[texture_index + 1]
+                            logger.log(
+                                f"Job {job.mesh_id} hit CUDA OOM while preparing assets at texture_map_max_size={texture_map_max_size}; "
+                                f"retrying with texture_map_max_size={next_texture_map_size}."
+                            )
+                            renderer = None
+                            assets = None
+                            renderer_cache.reset_after_cuda_failure(attempt_config)
+                            break
+                        if is_cuda_failure(exc):
+                            renderer = None
+                            assets = None
+                            renderer_cache.reset_after_cuda_failure(attempt_config)
+                        raise detached_exc
+                    finally:
+                        assets = None
+                if cameras is not None:
+                    break
+                if texture_last_exc is not None:
+                    last_exc = texture_last_exc
+                if should_retry_texture:
                     continue
-                if is_cuda_failure(exc):
-                    renderer = None
-                    renderer_cache.reset_after_cuda_failure(job.render_config)
-                raise
+            finally:
+                renderer = None
+                assets = None
+                renderer_cache.clear_texture_caches()
+                renderer_cache.release_cuda_memory()
         if cameras is None:
             if last_exc is not None:
                 raise last_exc
@@ -1465,6 +1626,7 @@ def build_argparser() -> argparse.ArgumentParser:
 @torch.inference_mode()
 def main() -> None:
     # Batch is the multi-process, multi-GPU entrypoint; render execution inside each worker remains sequential.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     args = build_argparser().parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for batch rendering")

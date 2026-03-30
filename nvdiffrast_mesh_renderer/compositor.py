@@ -1,8 +1,17 @@
+from dataclasses import dataclass
 from typing import Sequence, Tuple
 
 import torch
 
 from .types import RenderImage
+
+
+@dataclass
+class LayerStack:
+    rgb: torch.Tensor
+    alpha: torch.Tensor
+    depth: torch.Tensor
+    valid: torch.Tensor
 
 
 class LayerCompositor:
@@ -28,6 +37,56 @@ class LayerCompositor:
         for idx in range(sorted_rgb.shape[0]):
             out_rgb = sorted_rgb[idx] + out_rgb * (1.0 - sorted_alpha[idx])
             out_alpha = sorted_alpha[idx] + out_alpha * (1.0 - sorted_alpha[idx])
+        return out_rgb.unsqueeze(0), out_alpha.unsqueeze(0)
+
+    def create_layer_stack(self, bg_rgb: torch.Tensor, bg_alpha: torch.Tensor, capacity: int) -> LayerStack:
+        h, w = bg_rgb.shape[1], bg_rgb.shape[2]
+        device = bg_rgb.device
+        rgb_dtype = bg_rgb.dtype
+        alpha_dtype = bg_alpha.dtype
+        return LayerStack(
+            rgb=torch.zeros((capacity, h, w, 3), dtype=rgb_dtype, device=device),
+            alpha=torch.zeros((capacity, h, w, 1), dtype=alpha_dtype, device=device),
+            depth=torch.zeros((capacity, h, w, 1), dtype=alpha_dtype, device=device),
+            valid=torch.zeros((capacity, h, w, 1), dtype=torch.bool, device=device),
+        )
+
+    def accumulate_layer_stack(self, stack: LayerStack, layers: Sequence[RenderImage]) -> LayerStack:
+        if not layers:
+            return stack
+        new_rgb = torch.cat([layer.rgb for layer in layers], dim=0)
+        new_alpha = torch.cat([layer.alpha for layer in layers], dim=0)
+        new_depth = torch.cat([layer.depth for layer in layers], dim=0)
+        new_valid = torch.cat([layer.valid for layer in layers], dim=0)
+        rgb_all = torch.cat([stack.rgb, new_rgb], dim=0)
+        alpha_all = torch.cat([stack.alpha, new_alpha], dim=0)
+        depth_all = torch.cat([stack.depth, new_depth], dim=0)
+        valid_all = torch.cat([stack.valid, new_valid], dim=0)
+        inf_depth = torch.full_like(depth_all, float('inf'))
+        nearest_order = torch.argsort(torch.where(valid_all, depth_all, inf_depth)[..., 0], dim=0, descending=False)
+        keep = nearest_order[: stack.rgb.shape[0]]
+        gather_rgb = keep[..., None].expand(-1, -1, -1, 3)
+        gather_scalar = keep[..., None].expand(-1, -1, -1, 1)
+        return LayerStack(
+            rgb=torch.gather(rgb_all, 0, gather_rgb),
+            alpha=torch.gather(alpha_all, 0, gather_scalar),
+            depth=torch.gather(depth_all, 0, gather_scalar),
+            valid=torch.gather(valid_all, 0, gather_scalar),
+        )
+
+    def composite_layer_stack(
+        self,
+        bg_rgb: torch.Tensor,
+        bg_alpha: torch.Tensor,
+        stack: LayerStack,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        out_rgb, out_alpha = bg_rgb[0], bg_alpha[0]
+        for idx in range(stack.rgb.shape[0] - 1, -1, -1):
+            valid = stack.valid[idx]
+            rgb = torch.where(valid.expand_as(stack.rgb[idx]), stack.rgb[idx], torch.zeros_like(stack.rgb[idx]))
+            alpha = torch.where(valid, stack.alpha[idx], torch.zeros_like(stack.alpha[idx]))
+            out_rgb = rgb + out_rgb * (1.0 - alpha)
+            out_alpha = alpha + out_alpha * (1.0 - alpha)
         return out_rgb.unsqueeze(0), out_alpha.unsqueeze(0)
 
     def merge_double_sided(self, front: RenderImage, back: RenderImage, alpha_mode: str) -> RenderImage:

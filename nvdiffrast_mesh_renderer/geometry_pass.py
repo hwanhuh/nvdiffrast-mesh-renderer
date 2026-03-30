@@ -5,6 +5,7 @@ import torch
 import nvdiffrast.torch as dr
 
 from .config import RenderConfig
+from .geometry_utils import compute_face_normals_torch, compute_vertex_tangents_torch
 from .math_utils import safe_normalize
 from .textures import sample_texture
 from .types import CameraData, GeometryBuffer, MeshData, RenderLayer
@@ -16,21 +17,31 @@ class GeometryPassRenderer:
         self.config = config
 
     def render_geometry_pass(self, mesh: MeshData, camera: CameraData) -> List[RenderLayer]:
-        clip_pos = torch.matmul(mesh.positions_h, camera.mvp.t()).contiguous()
+        positions_h = torch.cat([mesh.positions, torch.ones_like(mesh.positions[:, :1])], dim=-1).contiguous()
+        clip_pos = torch.matmul(positions_h, camera.mvp.t()).contiguous()
         clip_pos_batch = clip_pos.unsqueeze(0)
-        view_attr = torch.matmul(mesh.positions_h, camera.view.t())[:, :3].contiguous()
+        view_attr = torch.matmul(positions_h, camera.view.t())[:, :3].contiguous()
+        face_normals = compute_face_normals_torch(mesh.positions, mesh.faces)
+        tangents = self._resolve_tangents(mesh)
         front_tri, front_normals, back_tri, back_normals = self._split_triangles_by_facing(
             mesh.faces,
             mesh.positions,
-            mesh.face_normals,
+            face_normals,
             camera,
         )
         cull_backfaces = self.config.cull_mode == "force" or (self.config.cull_mode == "auto" and not mesh.material.double_sided)
         front_layer_limit = 1 if cull_backfaces else self.config.double_sided_depth_peels
-        layers = self._render_side_layers(mesh, camera, clip_pos_batch, view_attr, front_tri, front_normals, side="front", max_layers=front_layer_limit)
+        layers = self._render_side_layers(mesh, camera, clip_pos_batch, view_attr, tangents, front_tri, front_normals, side="front", max_layers=front_layer_limit)
         if not cull_backfaces:
-            layers.extend(self._render_side_layers(mesh, camera, clip_pos_batch, view_attr, back_tri, back_normals, side="back", max_layers=self.config.double_sided_depth_peels))
+            layers.extend(self._render_side_layers(mesh, camera, clip_pos_batch, view_attr, tangents, back_tri, back_normals, side="back", max_layers=self.config.double_sided_depth_peels))
         return layers
+
+    def _resolve_tangents(self, mesh: MeshData) -> Optional[torch.Tensor]:
+        if mesh.material.normal_texture is None or mesh.uv is None:
+            return None
+        if mesh.tangents is not None:
+            return mesh.tangents
+        return compute_vertex_tangents_torch(mesh.positions, mesh.faces, mesh.uv, mesh.normals)
 
     def _render_side_layers(
         self,
@@ -38,6 +49,7 @@ class GeometryPassRenderer:
         camera: CameraData,
         clip_pos_batch: torch.Tensor,
         view_attr: torch.Tensor,
+        tangents: Optional[torch.Tensor],
         tri: torch.Tensor,
         face_normals: torch.Tensor,
         side: str,
@@ -47,7 +59,7 @@ class GeometryPassRenderer:
             return []
         tri = tri.contiguous()
         if max_layers <= 1:
-            layer = self._render_layer(mesh, camera, clip_pos_batch, view_attr, tri, face_normals, side)
+            layer = self._render_layer(mesh, camera, clip_pos_batch, view_attr, tangents, tri, face_normals, side)
             return [] if layer is None else [layer]
         layers: List[RenderLayer] = []
         # Peel sequential depth layers within one winding bucket so self-occluding double-sided shells can contribute more than one surface.
@@ -60,7 +72,7 @@ class GeometryPassRenderer:
         ) as peeler:
             for _ in range(max_layers):
                 rast, rast_db = peeler.rasterize_next_layer()
-                layer = self._build_layer_from_raster(mesh, camera, clip_pos_batch, view_attr, tri, face_normals, side, rast, rast_db)
+                layer = self._build_layer_from_raster(mesh, camera, clip_pos_batch, view_attr, tangents, tri, face_normals, side, rast, rast_db)
                 if layer is None:
                     break
                 layers.append(layer)
@@ -72,6 +84,7 @@ class GeometryPassRenderer:
         camera: CameraData,
         clip_pos_batch: torch.Tensor,
         view_attr: torch.Tensor,
+        tangents: Optional[torch.Tensor],
         tri: torch.Tensor,
         face_normals: torch.Tensor,
         side: str,
@@ -79,7 +92,7 @@ class GeometryPassRenderer:
         if tri.shape[0] == 0:
             return None
         rast, rast_db = self._rasterize_triangles(clip_pos_batch, tri)
-        return self._build_layer_from_raster(mesh, camera, clip_pos_batch, view_attr, tri, face_normals, side, rast, rast_db)
+        return self._build_layer_from_raster(mesh, camera, clip_pos_batch, view_attr, tangents, tri, face_normals, side, rast, rast_db)
 
     def _build_layer_from_raster(
         self,
@@ -87,6 +100,7 @@ class GeometryPassRenderer:
         camera: CameraData,
         clip_pos_batch: torch.Tensor,
         view_attr: torch.Tensor,
+        tangents: Optional[torch.Tensor],
         tri: torch.Tensor,
         face_normals: torch.Tensor,
         side: str,
@@ -101,7 +115,7 @@ class GeometryPassRenderer:
         view_pos, _ = dr.interpolate(view_attr, rast, tri)
         normal_world, _ = dr.interpolate(mesh.normals.contiguous(), rast, tri)
         uv, uv_da = self._interpolate_optional(mesh.uv, rast, tri, rast_db, "all")
-        tangent, _ = self._interpolate_optional(mesh.tangents, rast, tri)
+        tangent, _ = self._interpolate_optional(tangents, rast, tri)
         vertex_color, _ = self._interpolate_optional(mesh.vertex_colors, rast, tri)
         face_normal_world = self._gather_face_normals(face_normals, rast)
         view_rot = camera.view[:3, :3]

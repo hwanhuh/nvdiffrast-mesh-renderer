@@ -242,8 +242,8 @@ def add_render_arguments(
     parser.add_argument("--env-background-intensity", type=float, default=1.0, help="Environment background multiplier")
     parser.add_argument("--env-diffuse-samples", type=int, default=16, help="Cosine-weighted env diffuse sample count")
     parser.add_argument("--background", default="transparent", help="transparent or r,g,b[,a] in 0-1 range")
-    parser.add_argument("--light-intensity", type=float, default=1.1, help="Directional light multiplier")
-    parser.add_argument("--exposure", type=float, default=1.0, help="Linear exposure before tone mapping")
+    parser.add_argument("--light-intensity", type=float, default=1.35, help="Directional light multiplier")
+    parser.add_argument("--exposure", type=float, default=1.2, help="Linear exposure before tone mapping")
     parser.add_argument("--tonemap", choices=TONEMAP_CHOICES, default="reinhard", help="Tone mapping operator")
     parser.add_argument(
         "--cull-mode",
@@ -350,8 +350,8 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         background=str(background_value) if isinstance(background_value, str) else ",".join(str(v) for v in np.asarray(background_value).reshape(-1)),
         background_rgba=background_rgba,
         background_transparent=background_transparent,
-        light_intensity=float(getattr(args, "light_intensity", 1.1)),
-        exposure=float(getattr(args, "exposure", 1.0)),
+        light_intensity=float(getattr(args, "light_intensity", 1.35)),
+        exposure=float(getattr(args, "exposure", 1.2)),
         tonemap=str(getattr(args, "tonemap", "reinhard")),
         cull_mode=str(getattr(args, "cull_mode", "auto")),
         antialias=not bool(getattr(args, "no_antialias", False)),

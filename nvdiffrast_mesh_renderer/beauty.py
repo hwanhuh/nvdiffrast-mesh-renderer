@@ -213,7 +213,7 @@ class RenderModeRenderer:
         metallic: torch.Tensor,
         gbuf,
     ) -> torch.Tensor:
-        ambient = torch.tensor([0.04, 0.045, 0.05], device=base_rgb.device, dtype=base_rgb.dtype).view(1, 1, 1, 3)
+        ambient = torch.tensor([0.08, 0.085, 0.09], device=base_rgb.device, dtype=base_rgb.dtype).view(1, 1, 1, 3)
         if workflow != "pbr":
             shaded = emissive + ambient * base_rgb * ao
             for light_dir, light_color in self.lights:
@@ -224,7 +224,7 @@ class RenderModeRenderer:
             return torch.where(gbuf.valid.expand_as(base_rgb), shaded, torch.zeros_like(base_rgb))
         f0 = 0.04 * (1.0 - metallic) + base_rgb * metallic
         n_dot_v = torch.clamp(torch.sum(normal * view_dir, dim=-1, keepdim=True), min=1e-4, max=1.0)
-        fallback_ambient = ambient * 0.25 * base_rgb * (1.0 - metallic) * ao if self.ibl is None else torch.zeros_like(base_rgb)
+        fallback_ambient = ambient * 0.75 * base_rgb * (1.0 - metallic) * ao if self.ibl is None else torch.zeros_like(base_rgb)
         shaded = emissive + fallback_ambient
         for light_dir, light_color in self.lights:
             light = safe_normalize(light_dir.expand_as(normal))

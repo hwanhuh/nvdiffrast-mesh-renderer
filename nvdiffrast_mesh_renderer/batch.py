@@ -1444,6 +1444,58 @@ def _restart_worker(
     return _start_worker(ctx, worker.slot, worker.gpu_index, result_queue, log_path, echo, enable_prefetch)
 
 
+def _best_effort_gpu_lane_cleanup(gpu_index: int, batch_logger: RunLogger) -> None:
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.set_device(gpu_index)
+    except Exception as exc:
+        batch_logger.log(f"GPU lane cleanup set_device failed for gpu={gpu_index}: {type(exc).__name__}: {exc}")
+        return
+    for op_name, op in (
+        ("synchronize", lambda: torch.cuda.synchronize(device=gpu_index)),
+        ("empty_cache", torch.cuda.empty_cache),
+        ("ipc_collect", torch.cuda.ipc_collect),
+    ):
+        try:
+            op()
+        except Exception as exc:
+            batch_logger.log(
+                f"GPU lane cleanup {op_name} failed for gpu={gpu_index}: {type(exc).__name__}: {exc}"
+            )
+
+
+def _respawn_worker_with_gpu_recovery(
+    *,
+    ctx: mp.context.BaseContext,
+    worker: WorkerState,
+    result_queue: Any,
+    log_path: str,
+    echo: bool,
+    enable_prefetch: bool,
+    batch_logger: RunLogger,
+    restart_attempts: int,
+    spawn_probe_sec: float,
+) -> tuple[WorkerState, bool]:
+    candidate = worker
+    _best_effort_gpu_lane_cleanup(worker.gpu_index, batch_logger)
+    for attempt in range(1, restart_attempts + 1):
+        candidate = _restart_worker(ctx, candidate, result_queue, log_path, echo, enable_prefetch)
+        if spawn_probe_sec > 0:
+            time.sleep(spawn_probe_sec)
+        if candidate.process.is_alive():
+            if attempt > 1:
+                batch_logger.log(
+                    f"Worker respawn recovered after retries: slot={candidate.slot}, gpu={candidate.gpu_index}, attempts={attempt}"
+                )
+            return candidate, True
+        batch_logger.log(
+            f"Worker respawn failed: slot={candidate.slot}, gpu={candidate.gpu_index}, attempt={attempt}/{restart_attempts}"
+        )
+        _best_effort_gpu_lane_cleanup(candidate.gpu_index, batch_logger)
+    return candidate, False
+
+
 def _stop_worker(worker: WorkerState) -> None:
     if worker.process.is_alive():
         try:
@@ -1591,6 +1643,26 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--fail-fast", action="store_true", help="Abort the batch after the first failed job")
     parser.add_argument("--max-failures", type=int, default=None, help="Abort the batch after this many failures")
     parser.add_argument("--mesh-timeout-sec", type=float, default=None, help="Optional per-mesh wall-clock timeout")
+    parser.add_argument("--exit-on-worker-exit", action="store_true", help="Exit this batch process after a worker exits unexpectedly so an external supervisor can restart a clean worker pool.")
+    parser.add_argument("--exit-on-timeout", action="store_true", help="Exit this batch process after a mesh timeout so an external supervisor can restart a clean worker pool.")
+    parser.add_argument(
+        "--worker-restart-attempts",
+        type=int,
+        default=3,
+        help="Respawn attempts for a worker lane after worker exit/timeout.",
+    )
+    parser.add_argument(
+        "--worker-spawn-probe-sec",
+        type=float,
+        default=0.2,
+        help="Delay used to verify a respawned worker stays alive before assigning a new job.",
+    )
+    parser.add_argument(
+        "--worker-exit-disable-threshold",
+        type=int,
+        default=8,
+        help="Disable a GPU lane after this many consecutive WorkerExitError failures.",
+    )
     parser.add_argument("--meshes-per-output-shard", type=int, default=1000, help="Mesh directories per output shard")
     parser.add_argument("--image-format", choices=["png", "jpg"], default="png", help="Output image format")
     parser.add_argument("--jpg-quality", type=int, default=95, help="JPEG quality when image-format=jpg")
@@ -1647,6 +1719,12 @@ def main() -> None:
         raise ValueError("--max-failures must be positive")
     if args.mesh_timeout_sec is not None and args.mesh_timeout_sec <= 0:
         raise ValueError("--mesh-timeout-sec must be positive")
+    if args.worker_restart_attempts <= 0:
+        raise ValueError("--worker-restart-attempts must be positive")
+    if args.worker_spawn_probe_sec < 0:
+        raise ValueError("--worker-spawn-probe-sec must be non-negative")
+    if args.worker_exit_disable_threshold <= 0:
+        raise ValueError("--worker-exit-disable-threshold must be positive")
     if args.meshes_per_output_shard <= 0:
         raise ValueError("--meshes-per-output-shard must be positive")
     if not 1 <= args.jpg_quality <= 100:
@@ -1858,6 +1936,8 @@ def main() -> None:
                 batch_logger.log("Aborting during job normalization due to fail-fast/max-failures policy.")
                 break
 
+    restart_requested = False
+    restart_reason = ""
     if not abort_requested and jobs_to_run:
         ctx = mp.get_context("spawn")
         result_queue = ctx.Queue()
@@ -1868,18 +1948,79 @@ def main() -> None:
             for slot, gpu_index in enumerate(gpu_list)
         ]
         pending_jobs = list(jobs_to_run)
+        worker_exit_streak: dict[int, int] = {worker.slot: 0 for worker in workers}
+        disabled_worker_slots: set[int] = set()
+
+        def _disable_worker_slot(index: int, reason: str) -> None:
+            worker = workers[index]
+            if worker.slot in disabled_worker_slots:
+                return
+            if worker.queued_job is not None:
+                pending_jobs.insert(0, worker.queued_job)
+                worker.queued_job = None
+            worker.current_job = None
+            worker.current_started_at = None
+            worker.current_started_mono = None
+            _stop_worker(worker)
+            disabled_worker_slots.add(worker.slot)
+            _record_event(
+                events_path,
+                "worker_disabled",
+                slot=worker.slot,
+                gpu_index=worker.gpu_index,
+                reason=reason,
+            )
+            batch_logger.log(
+                f"Disabled worker lane: slot={worker.slot}, gpu={worker.gpu_index}, reason={reason}"
+            )
+
         batch_logger.log(f"Dispatching {len(pending_jobs)} job(s) across {len(workers)} worker(s).")
         try:
             while pending_jobs or any(worker.current_job is not None or worker.queued_job is not None for worker in workers):
+                if pending_jobs and not any(worker.slot not in disabled_worker_slots for worker in workers):
+                    abort_requested = True
+                    batch_logger.log(
+                        "All worker lanes are disabled while pending jobs remain; aborting batch."
+                    )
+                    break
                 if not abort_requested:
                     for index, worker in enumerate(workers):
+                        if worker.slot in disabled_worker_slots:
+                            continue
                         if worker.current_job is None:
                             if not worker.process.is_alive():
                                 if worker.queued_job is not None:
                                     pending_jobs.insert(0, worker.queued_job)
                                     worker.queued_job = None
-                                workers[index] = worker = _restart_worker(ctx, worker, result_queue, log_path, echo, enable_prefetch)
+                                worker_exit_streak[worker.slot] = worker_exit_streak.get(worker.slot, 0) + 1
+                                batch_logger.log(
+                                    f"Idle worker exited unexpectedly: slot={worker.slot}, gpu={worker.gpu_index}; "
+                                    "running GPU lane recovery and respawn."
+                                )
+                                workers[index], recovered = _respawn_worker_with_gpu_recovery(
+                                    ctx=ctx,
+                                    worker=worker,
+                                    result_queue=result_queue,
+                                    log_path=log_path,
+                                    echo=echo,
+                                    enable_prefetch=enable_prefetch,
+                                    batch_logger=batch_logger,
+                                    restart_attempts=args.worker_restart_attempts,
+                                    spawn_probe_sec=args.worker_spawn_probe_sec,
+                                )
+                                worker = workers[index]
+                                if not recovered or not worker.process.is_alive():
+                                    _disable_worker_slot(
+                                        index,
+                                        reason=(
+                                            f"idle_respawn_failed_after_{args.worker_restart_attempts}_attempts"
+                                        ),
+                                    )
+                                    continue
                             if not pending_jobs:
+                                continue
+                            if not worker.process.is_alive():
+                                _disable_worker_slot(index, reason="worker_not_alive_before_assignment")
                                 continue
                             job = pending_jobs.pop(0)
                             _start_job_on_worker(worker, job, enqueue=True)
@@ -1895,6 +2036,7 @@ def main() -> None:
                 if result is not None:
                     worker = workers[result["worker_slot"]]
                     _finalize_job_result(conn, events_path, result)
+                    worker_exit_streak[worker.slot] = 0
                     if result["status"] == "success":
                         success_count += 1
                         success_metrics.append(result)
@@ -1926,21 +2068,53 @@ def main() -> None:
                             if abort_requested:
                                 worker.queued_job = None
                 for index, worker in enumerate(workers):
+                    if worker.slot in disabled_worker_slots:
+                        continue
                     if worker.current_job is None:
                         if worker.queued_job is not None and not worker.process.is_alive():
                             pending_jobs.insert(0, worker.queued_job)
                             worker.queued_job = None
                         if not worker.process.is_alive():
-                            workers[index] = _restart_worker(ctx, worker, result_queue, log_path, echo, enable_prefetch)
+                            worker_exit_streak[worker.slot] = worker_exit_streak.get(worker.slot, 0) + 1
+                            workers[index], recovered = _respawn_worker_with_gpu_recovery(
+                                ctx=ctx,
+                                worker=worker,
+                                result_queue=result_queue,
+                                log_path=log_path,
+                                echo=echo,
+                                enable_prefetch=enable_prefetch,
+                                batch_logger=batch_logger,
+                                restart_attempts=args.worker_restart_attempts,
+                                spawn_probe_sec=args.worker_spawn_probe_sec,
+                            )
+                            worker = workers[index]
+                            if not recovered or not worker.process.is_alive():
+                                _disable_worker_slot(
+                                    index,
+                                    reason=(
+                                        f"idle_respawn_failed_after_{args.worker_restart_attempts}_attempts"
+                                    ),
+                                )
                         continue
                     if not worker.process.is_alive():
                         duration_ms = 0.0
                         if worker.current_started_mono is not None:
                             duration_ms = (time.monotonic() - worker.current_started_mono) * 1000.0
-                        result = _external_failure_result(worker.current_job, worker, error_type="WorkerExitError", error_message="worker exited unexpectedly", duration_ms=duration_ms)
+                        result = _external_failure_result(
+                            worker.current_job,
+                            worker,
+                            error_type="WorkerExitError",
+                            error_message="worker exited unexpectedly",
+                            duration_ms=duration_ms,
+                        )
                         _finalize_job_result(conn, events_path, result)
                         failed_count += 1
-                        batch_logger.log(f"Worker exited unexpectedly for mesh_id={result['mesh_id']}; restarting worker.")
+                        worker_exit_streak[worker.slot] = worker_exit_streak.get(worker.slot, 0) + 1
+                        streak = worker_exit_streak[worker.slot]
+                        batch_logger.log(
+                            f"Worker exited unexpectedly for mesh_id={result['mesh_id']}, slot={worker.slot}, gpu={worker.gpu_index}; "
+                            f"marking mesh failed and recovering lane (streak={streak})."
+                        )
                         processed_count += 1
                         _progress("failed", f"{result['mesh_id']} worker-exit", last_ms=float(result["duration_ms"]))
                         if worker.queued_job is not None:
@@ -1949,7 +2123,31 @@ def main() -> None:
                         worker.current_job = None
                         worker.current_started_at = None
                         worker.current_started_mono = None
-                        workers[index] = _restart_worker(ctx, worker, result_queue, log_path, echo, enable_prefetch)
+                        if streak >= args.worker_exit_disable_threshold:
+                            _disable_worker_slot(index, reason=f"worker_exit_streak_{streak}")
+                            if args.fail_fast or (args.max_failures is not None and failed_count >= args.max_failures):
+                                abort_requested = True
+                                break
+                            continue
+                        workers[index], recovered = _respawn_worker_with_gpu_recovery(
+                            ctx=ctx,
+                            worker=worker,
+                            result_queue=result_queue,
+                            log_path=log_path,
+                            echo=echo,
+                            enable_prefetch=enable_prefetch,
+                            batch_logger=batch_logger,
+                            restart_attempts=args.worker_restart_attempts,
+                            spawn_probe_sec=args.worker_spawn_probe_sec,
+                        )
+                        worker = workers[index]
+                        if not recovered or not worker.process.is_alive():
+                            _disable_worker_slot(
+                                index,
+                                reason=(
+                                    f"respawn_failed_after_{args.worker_restart_attempts}_attempts"
+                                ),
+                            )
                         if args.fail_fast or (args.max_failures is not None and failed_count >= args.max_failures):
                             abort_requested = True
                             break
@@ -1968,7 +2166,10 @@ def main() -> None:
                             worker.process.join(timeout=5)
                             _finalize_job_result(conn, events_path, result)
                             failed_count += 1
-                            batch_logger.log(f"Timed out mesh_id={result['mesh_id']} after {args.mesh_timeout_sec} sec; restarting worker.")
+                            batch_logger.log(
+                                f"Timed out mesh_id={result['mesh_id']} after {args.mesh_timeout_sec} sec; "
+                                "marking failed and recovering lane."
+                            )
                             processed_count += 1
                             _progress("failed", f"{result['mesh_id']} timeout", last_ms=float(result["duration_ms"]))
                             if worker.queued_job is not None:
@@ -1977,10 +2178,31 @@ def main() -> None:
                             worker.current_job = None
                             worker.current_started_at = None
                             worker.current_started_mono = None
-                            workers[index] = _start_worker(ctx, worker.slot, worker.gpu_index, result_queue, log_path, echo, enable_prefetch)
+                            workers[index], recovered = _respawn_worker_with_gpu_recovery(
+                                ctx=ctx,
+                                worker=worker,
+                                result_queue=result_queue,
+                                log_path=log_path,
+                                echo=echo,
+                                enable_prefetch=enable_prefetch,
+                                batch_logger=batch_logger,
+                                restart_attempts=args.worker_restart_attempts,
+                                spawn_probe_sec=args.worker_spawn_probe_sec,
+                            )
+                            worker = workers[index]
+                            if not recovered or not worker.process.is_alive():
+                                _disable_worker_slot(
+                                    index,
+                                    reason=(
+                                        f"timeout_respawn_failed_after_{args.worker_restart_attempts}_attempts"
+                                    ),
+                                )
                             if args.fail_fast or (args.max_failures is not None and failed_count >= args.max_failures):
                                 abort_requested = True
                                 break
+                if restart_requested:
+                    batch_logger.log(f"Host restart requested ({restart_reason}); stopping workers without marking in-flight jobs as failed.")
+                    break
                 if abort_requested:
                     batch_logger.log("Batch abort requested; terminating in-flight workers.")
                     for worker in workers:
@@ -2005,6 +2227,11 @@ def main() -> None:
         finally:
             for worker in workers:
                 _stop_worker(worker)
+        if restart_requested:
+            _record_event(events_path, "batch_restart_requested", reason=restart_reason, success_count=success_count, failed_count=failed_count, skipped_count=skipped_count)
+            batch_logger.log(f"Exiting before summary for external supervisor restart: {restart_reason}", console="always")
+            conn.close()
+            raise SystemExit(75)
 
     finished_at = _utc_now()
     duration_sec = time.perf_counter() - batch_start_perf

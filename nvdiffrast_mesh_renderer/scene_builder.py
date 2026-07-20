@@ -55,6 +55,56 @@ def preload_scene_asset(path: pathlib.Path, texture_map_max_size: int = 0) -> Pr
     )
 
 
+def _iter_scene_meshes_standalone(scene: trimesh.Scene):
+    if len(scene.geometry) == 0:
+        return
+    nodes = list(getattr(scene.graph, "nodes_geometry", []))
+    if not nodes:
+        for geom_name, mesh in scene.geometry.items():
+            yield geom_name, mesh
+        return
+    for node_name in nodes:
+        _transform, geom_name = scene.graph[node_name]
+        mesh = scene.geometry.get(geom_name)
+        if mesh is not None:
+            yield geom_name, mesh
+
+
+def summarize_scene_asset(preloaded: PreloadedSceneAsset) -> PreloadedSceneSummary:
+    """Count meshes/vertices/faces without needing a CUDA device or renderer."""
+    mesh_count = 0
+    pbr_count = 0
+    vertex_count = 0
+    face_count = 0
+    for _name, mesh in _iter_scene_meshes_standalone(preloaded.scene):
+        if not isinstance(mesh, trimesh.Trimesh) or mesh.faces is None or len(mesh.faces) == 0:
+            continue
+        mesh_count += 1
+        vertex_count += int(len(mesh.vertices))
+        face_count += int(len(mesh.faces))
+        material = getattr(getattr(mesh, "visual", None), "material", None)
+        if isinstance(material, trimesh_material.PBRMaterial):
+            has_pbr_signals = any(
+                [
+                    material.metallicFactor is not None,
+                    material.roughnessFactor is not None,
+                    material.metallicRoughnessTexture is not None,
+                    material.normalTexture is not None,
+                    material.occlusionTexture is not None,
+                    material.emissiveTexture is not None,
+                    material.emissiveFactor is not None,
+                ]
+            )
+            if has_pbr_signals:
+                pbr_count += 1
+    return PreloadedSceneSummary(
+        mesh_count=mesh_count,
+        pbr_count=pbr_count,
+        vertex_count=vertex_count,
+        face_count=face_count,
+    )
+
+
 class SceneBuilder:
     def __init__(self, cache: TextureCache, device: torch.device, *, texture_map_max_size: int = 0):
         self.cache = cache
@@ -323,10 +373,31 @@ class SceneBuilder:
         return self._clip_planes_from_depth_range(positive_depth_min, positive_depth_max)
 
     def _clip_planes_from_depth_range(self, depth_min: float, depth_max: float) -> tuple[float, float]:
-        depth_min = max(float(depth_min), 1e-3)
-        depth_max = max(float(depth_max), depth_min + 1e-3)
-        near = max(0.01, depth_min * 0.95)
-        far = max(near + 1.0, depth_max * 1.05)
+        fallback = (0.01, 1.0)
+        try:
+            depth_min = float(depth_min)
+            depth_max = float(depth_max)
+        except (TypeError, ValueError):
+            return fallback
+        if not math.isfinite(depth_min) or not math.isfinite(depth_max):
+            return fallback
+
+        if depth_min > depth_max:
+            depth_min, depth_max = depth_max, depth_min
+        depth_scale = max(abs(depth_min), abs(depth_max))
+        if depth_scale == 0.0 or depth_max <= 0.0:
+            return fallback
+
+        minimum_span = depth_scale * 1e-6
+        if not math.isfinite(minimum_span) or minimum_span <= 0.0:
+            return fallback
+        if depth_min <= 0.0:
+            depth_min = minimum_span
+
+        near = depth_min * 0.95
+        far = max(depth_max * 1.05, near + minimum_span)
+        if not math.isfinite(near) or not math.isfinite(far) or near <= 0.0 or far <= near:
+            return fallback
         return near, far
 
     def _projection_matrix(self, config: RenderConfig, near: float, far: float, distance: float) -> np.ndarray:

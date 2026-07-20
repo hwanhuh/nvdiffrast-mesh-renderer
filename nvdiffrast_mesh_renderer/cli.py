@@ -11,11 +11,13 @@ from .image_io import AsyncImageSaver
 from .lifecycle import RendererCache, is_cuda_failure, is_cuda_oom
 from .logging_utils import RunLogger, estimate_remaining_ms, format_duration_ms, format_path_notice
 from .renderer import SceneRenderer
+from .scene_builder import preload_scene_asset, summarize_scene_asset
 from .view_presets import (
     CANONICAL_RENDER_COND_MAX_ABS_ELEV,
     CANONICAL_RENDER_COND_VIEW_COUNT,
     generate_canonical_render_cond_views,
 )
+from .vram_utils import RenderStrategy, format_bytes, pick_safe_render_strategy
 
 CANONICAL_SIX_VIEW_SPECS = (
     ("front", 0.0, 0.0),
@@ -684,6 +686,77 @@ def _render_multiview_pass(
             pass
 
 
+def _apply_vram_strategy(
+    *,
+    base_config,
+    preloaded_scene,
+    scene_summary,
+    chunk_sizes: tuple[int, ...],
+    view_count: int,
+    render_mode_count: int,
+    input_path: pathlib.Path,
+    logger: RunLogger,
+) -> tuple[object, object, tuple[int, ...], bool | None]:
+    """Probe free VRAM and adjust config/chunk_sizes when OOM looks likely.
+
+    Returns the (possibly updated) base_config, preloaded_scene,
+    chunk_sizes tuple to use, and the force_streaming hint to pass
+    through to prepare_assets (None means "let the auto heuristic
+    decide").
+    """
+    strategy: RenderStrategy = pick_safe_render_strategy(
+        vertex_count=scene_summary.vertex_count,
+        face_count=scene_summary.face_count,
+        initial_chunk_size=chunk_sizes[0],
+        view_count=view_count,
+        resolution=base_config.resolution,
+        render_mode_count=render_mode_count,
+        depth_peels=base_config.double_sided_depth_peels,
+        antialias=base_config.antialias,
+        current_texture_cap=base_config.texture_map_max_size,
+        device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+    )
+    summary_msg = (
+        f"VRAM check: vertices={scene_summary.vertex_count}, faces={scene_summary.face_count}, "
+        f"views={view_count}, modes={render_mode_count}, free={format_bytes(strategy.free_bytes)}, "
+        f"estimated_peak={format_bytes(strategy.estimated_bytes)}, decision={strategy.reason}"
+    )
+    logger.log(summary_msg)
+    if strategy.reason == "within_budget":
+        return base_config, preloaded_scene, chunk_sizes, None
+
+    new_config = base_config
+    new_preloaded = preloaded_scene
+    if strategy.texture_cap_override is not None and strategy.texture_cap_override != base_config.texture_map_max_size:
+        new_config = replace(new_config, texture_map_max_size=strategy.texture_cap_override)
+        new_preloaded = preload_scene_asset(input_path, texture_map_max_size=new_config.texture_map_max_size)
+        logger.log(
+            f"VRAM bypass: capping texture maps to {strategy.texture_cap_override}px",
+            console="always",
+            console_message=f"[Info] VRAM bypass: texture cap -> {strategy.texture_cap_override}px",
+        )
+
+    if strategy.recommended_chunk_size < chunk_sizes[0]:
+        filtered = tuple(size for size in chunk_sizes if size <= strategy.recommended_chunk_size)
+        new_chunk_sizes = filtered if filtered else (1,)
+        logger.log(
+            f"VRAM bypass: starting chunk size lowered from {chunk_sizes[0]} to {new_chunk_sizes[0]}",
+            console="always",
+            console_message=f"[Info] VRAM bypass: chunk size -> {new_chunk_sizes[0]}",
+        )
+    else:
+        new_chunk_sizes = chunk_sizes
+
+    force_streaming: bool | None = True if strategy.force_streaming else None
+    if strategy.force_streaming:
+        logger.log(
+            "VRAM bypass: forcing mesh-by-mesh streaming render path",
+            console="always",
+            console_message="[Info] VRAM bypass: streaming mode forced",
+        )
+    return new_config, new_preloaded, new_chunk_sizes, force_streaming
+
+
 # Standalone multi-view is also sequential: one renderer/context per invocation, no raster thread pool.
 def _render_multiview_from_config(config) -> tuple[list[pathlib.Path], pathlib.Path]:
     if config.render_all:
@@ -714,13 +787,32 @@ def _render_multiview_from_config(config) -> tuple[list[pathlib.Path], pathlib.P
     run_started = time.perf_counter()
     session_init_ms = 0.0
     data_loading_ms = 0.0
+    input_path = pathlib.Path(config.input)
     try:
+        preload_start = time.perf_counter()
+        preloaded_scene = preload_scene_asset(input_path, texture_map_max_size=base_config.texture_map_max_size)
+        scene_summary = summarize_scene_asset(preloaded_scene)
+        data_loading_ms += (time.perf_counter() - preload_start) * 1000.0
+        base_config, preloaded_scene, chunk_sizes, force_streaming = _apply_vram_strategy(
+            base_config=base_config,
+            preloaded_scene=preloaded_scene,
+            scene_summary=scene_summary,
+            chunk_sizes=chunk_sizes,
+            view_count=len(view_specs),
+            render_mode_count=len(render_modes),
+            input_path=input_path,
+            logger=logger,
+        )
         init_start = time.perf_counter()
         renderer, _created = renderer_cache.get_with_status(base_config)
         if _created:
             session_init_ms += (time.perf_counter() - init_start) * 1000.0
         assets_start = time.perf_counter()
-        assets = renderer.prepare_assets(pathlib.Path(config.input))
+        assets = renderer.prepare_assets(
+            input_path,
+            preloaded_scene=preloaded_scene,
+            force_streaming=force_streaming,
+        )
         data_loading_ms += (time.perf_counter() - assets_start) * 1000.0
         if getattr(config, "canonical_mv_conditions", False):
             logger.log(

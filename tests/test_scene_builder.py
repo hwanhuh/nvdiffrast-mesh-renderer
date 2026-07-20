@@ -1,3 +1,4 @@
+import math
 import unittest
 from types import SimpleNamespace
 
@@ -12,11 +13,37 @@ class SceneBuilderClipPlaneTests(unittest.TestCase):
     def setUp(self):
         self.builder = SceneBuilder(TextureCache(torch.device("cpu")), torch.device("cpu"))
 
-    def test_clip_planes_from_depth_range_track_visible_span(self):
-        near, far = self.builder._clip_planes_from_depth_range(68.0, 179.0)
+    def test_clip_planes_from_depth_range_are_scale_covariant(self):
+        base_depth_min = 1.216
+        base_depth_max = 3.021
+        for name, scale in (("normal", 1.0), ("tiny", 1e-3)):
+            with self.subTest(name=name):
+                depth_min = base_depth_min * scale
+                depth_max = base_depth_max * scale
+                near, far = self.builder._clip_planes_from_depth_range(depth_min, depth_max)
 
-        self.assertAlmostEqual(near, 64.6)
-        self.assertAlmostEqual(far, 187.95)
+                self.assertTrue(math.isfinite(near))
+                self.assertTrue(math.isfinite(far))
+                self.assertGreater(near, 0.0)
+                self.assertLess(near, depth_min)
+                self.assertGreater(far, depth_max)
+                self.assertAlmostEqual((depth_min - near) / depth_min, 0.05)
+                self.assertAlmostEqual((far - depth_max) / depth_max, 0.05)
+                self.assertAlmostEqual(near / scale, base_depth_min * 0.95)
+                self.assertAlmostEqual(far / scale, base_depth_max * 1.05)
+
+    def test_clip_planes_from_depth_range_guard_invalid_ranges(self):
+        expected = self.builder._clip_planes_from_depth_range(0.001216, 0.003021)
+        reversed_range = self.builder._clip_planes_from_depth_range(0.003021, 0.001216)
+        self.assertEqual(reversed_range, expected)
+
+        for depth_min, depth_max in ((math.nan, 1.0), (1.0, math.inf), (0.0, 0.0)):
+            with self.subTest(depth_min=depth_min, depth_max=depth_max):
+                near, far = self.builder._clip_planes_from_depth_range(depth_min, depth_max)
+                self.assertTrue(math.isfinite(near))
+                self.assertTrue(math.isfinite(far))
+                self.assertGreater(near, 0.0)
+                self.assertGreater(far, near)
 
     def test_clip_planes_from_meshes_ignore_points_behind_camera(self):
         positions_h = torch.tensor(

@@ -46,15 +46,15 @@ class SceneBuilderClipPlaneTests(unittest.TestCase):
                 self.assertGreater(far, near)
 
     def test_clip_planes_from_meshes_ignore_points_behind_camera(self):
-        positions_h = torch.tensor(
+        positions = torch.tensor(
             [
-                [0.0, 0.0, -68.0, 1.0],
-                [0.0, 0.0, -179.0, 1.0],
-                [0.0, 0.0, 10.0, 1.0],
+                [0.0, 0.0, -68.0],
+                [0.0, 0.0, -179.0],
+                [0.0, 0.0, 10.0],
             ],
             dtype=torch.float32,
         )
-        mesh = SimpleNamespace(positions_h=positions_h)
+        mesh = SimpleNamespace(positions=positions)
         near, far = self.builder._clip_planes_from_meshes([mesh], np.eye(4, dtype=np.float32))
 
         self.assertAlmostEqual(near, 64.6)
@@ -82,6 +82,33 @@ class SceneBuilderClipPlaneTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(camera_near.proj[0, 0].item()), 1.0 / 3.0, places=6)
         self.assertAlmostEqual(float(camera_far.proj[0, 0].item()), 1.0 / 6.0, places=6)
+
+    def test_apply_transform_accepts_zero_scale_scene_nodes(self):
+        vertices = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
+        normals = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+        transform = np.eye(4, dtype=np.float32)
+        transform[1, 1] = 0.0
+        transform[:3, 3] = [4.0, 5.0, 6.0]
+
+        transformed_vertices, transformed_normals = self.builder._apply_transform(
+            vertices,
+            normals,
+            transform,
+        )
+
+        np.testing.assert_allclose(transformed_vertices, [[5.0, 5.0, 9.0]])
+        self.assertTrue(np.isfinite(transformed_normals).all())
+
+    def test_sanitize_uv_coordinates_wraps_only_corrupt_values(self):
+        ordinary = np.array([[-4.5, 8.25], [2.0, 3.0]], dtype=np.float32)
+        sanitized = self.builder._sanitize_uv_coordinates(ordinary)
+        np.testing.assert_array_equal(sanitized, ordinary)
+
+        corrupt = np.array([[1e30, -1e30], [np.nan, np.inf]], dtype=np.float32)
+        sanitized = self.builder._sanitize_uv_coordinates(corrupt)
+        self.assertTrue(np.isfinite(sanitized).all())
+        self.assertTrue((sanitized >= 0.0).all())
+        self.assertTrue((sanitized < 1.0).all())
 
     def test_view_seeded_lights_are_deterministic(self):
         lights_a = self.builder.build_view_seeded_lights(1.1, camera_direction=np.array([0.0, 0.0, 1.0], dtype=np.float32), view_seed=1234)

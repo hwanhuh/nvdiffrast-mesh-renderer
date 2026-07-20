@@ -57,6 +57,7 @@ BATCH_OVERRIDE_KEYS = frozenset(
         "exposure",
         "tonemap",
         "cull_mode",
+        "ignore_material_alpha",
         "normalize_depth",
         "wireframe_color",
         "wireframe_opacity",
@@ -96,6 +97,7 @@ class RenderConfig:
     exposure: float
     tonemap: str
     cull_mode: str
+    ignore_material_alpha: bool
     antialias: bool
     display: bool
     print_progress: bool
@@ -251,6 +253,11 @@ def add_render_arguments(
         default="auto",
         help="Backface handling. auto: cull iff material.double_sided is false; off: render both winding buckets; force: front faces only.",
     )
+    parser.add_argument(
+        "--ignore-material-alpha",
+        action="store_true",
+        help="Use rasterized geometry coverage instead of material opacity for diagnostic renders.",
+    )
     parser.add_argument("--render-mode", choices=RENDER_MODE_CHOICES, default="beauty", help="Named render mode entrypoint.")
     parser.add_argument("--wireframe-color", default="0.2,1.0,0.25", help="Wireframe overlay color as r,g,b in 0-1 range")
     parser.add_argument("--wireframe-opacity", type=float, default=1.0, help="Wireframe overlay opacity multiplier")
@@ -354,6 +361,7 @@ def config_from_args(args: argparse.Namespace) -> RenderConfig:
         exposure=float(getattr(args, "exposure", 1.2)),
         tonemap=str(getattr(args, "tonemap", "reinhard")),
         cull_mode=str(getattr(args, "cull_mode", "auto")),
+        ignore_material_alpha=bool(getattr(args, "ignore_material_alpha", False)),
         antialias=not bool(getattr(args, "no_antialias", False)),
         display=bool(getattr(args, "display", False)),
         print_progress=bool(getattr(args, "print_progress", False)),
@@ -429,7 +437,7 @@ def config_with_overrides(base_config: RenderConfig, overrides: dict[str, Any]) 
         if key == "double_sided_depth_peels":
             updates[key] = max(int(value), 1)
             continue
-        if key == "normalize_depth":
+        if key in {"ignore_material_alpha", "normalize_depth"}:
             updates[key] = bool(value)
             continue
         if key in {

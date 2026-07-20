@@ -1,4 +1,4 @@
-nvdiffrast_mesh_renderer/vram_utils.py"""Free-VRAM probe and conservative render-memory estimator.
+"""Free-VRAM probe and conservative render-memory estimator.
 
 The estimator does not aim for prediction accuracy; it provides a coarse
 upper bound used to decide whether to take the streaming bypass path

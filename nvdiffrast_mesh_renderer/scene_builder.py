@@ -139,6 +139,7 @@ class SceneBuilder:
         normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
         uv = getattr(mesh.visual, "uv", None)
         uv = np.asarray(uv, dtype=np.float32) if uv is not None and len(uv) == len(vertices) else None
+        uv = self._sanitize_uv_coordinates(uv)
         vertices, normals = self._apply_transform(vertices, normals, entry.transform)
         material, vertex_colors = self.materials.extract(mesh, entry.override)
         positions = torch.as_tensor(vertices, dtype=torch.float32, device=self.device).contiguous()
@@ -155,6 +156,19 @@ class SceneBuilder:
             vertex_colors=None if vertex_colors is None else vertex_colors.contiguous(),
             material=material,
         )
+
+    @staticmethod
+    def _sanitize_uv_coordinates(uv: np.ndarray | None) -> np.ndarray | None:
+        if uv is None:
+            return None
+        uv = np.asarray(uv, dtype=np.float32)
+        if not np.isfinite(uv).all():
+            uv = np.nan_to_num(uv, nan=0.0, posinf=0.0, neginf=0.0)
+        if float(np.max(np.abs(uv), initial=0.0)) > 1e6:
+            # Values this large lose useful fractional precision in float32 and
+            # can fault CUDA texture sampling. Preserve only the wrapped tile.
+            uv = np.remainder(uv.astype(np.float64), 1.0).astype(np.float32)
+        return np.ascontiguousarray(uv)
 
     def summarize_preloaded(self, preloaded: PreloadedSceneAsset) -> PreloadedSceneSummary:
         mesh_count = 0
@@ -326,7 +340,12 @@ class SceneBuilder:
             return vertices, safe_normalize_np(normals.astype(np.float32, copy=False))
         linear = np.asarray(transform[:3, :3], dtype=np.float32)
         translate = np.asarray(transform[:3, 3], dtype=np.float32)
-        normal_matrix = np.linalg.inv(linear).T.astype(np.float32)
+        try:
+            normal_matrix = np.linalg.inv(linear).T.astype(np.float32)
+        except np.linalg.LinAlgError:
+            # Some GLBs contain zero-scale scene nodes. Their geometry can still
+            # be transformed, but the corresponding normal matrix is singular.
+            normal_matrix = np.linalg.pinv(linear).T.astype(np.float32)
         transformed_vertices = vertices @ linear.T + translate
         transformed_normals = safe_normalize_np(normals @ normal_matrix.T)
         return transformed_vertices.astype(np.float32, copy=False), transformed_normals.astype(np.float32, copy=False)

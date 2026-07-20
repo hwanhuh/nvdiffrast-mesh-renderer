@@ -157,6 +157,17 @@ class OglRenderModeTests(unittest.TestCase):
         expected = torch.tensor([[[[1.0]]]], dtype=torch.float32)
         self.assertTrue(torch.allclose(result.value, expected))
 
+    def test_ignore_material_alpha_uses_rasterized_geometry_coverage(self):
+        renderer = self._make_renderer()
+        renderer.config.ignore_material_alpha = True
+        layer = self._make_layer()
+        layer.mesh.material.alpha_mode = "BLEND"
+        layer.geometry.base_rgba[..., 3] = 0.0
+
+        alpha = renderer._resolve_alpha(layer)
+
+        self.assertTrue(torch.equal(alpha, layer.geometry.valid.float()))
+
 
 if __name__ == "__main__":
     unittest.main()

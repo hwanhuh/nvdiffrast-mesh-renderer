@@ -152,6 +152,8 @@ class RenderModeRenderer:
 
     def _resolve_alpha(self, layer: RenderLayer) -> torch.Tensor:
         material = layer.mesh.material
+        if getattr(self.config, "ignore_material_alpha", False):
+            return layer.geometry.valid.float()
         alpha = layer.geometry.base_rgba[..., 3:4]
         if material.alpha_mode == "OPAQUE":
             alpha = torch.ones_like(alpha)

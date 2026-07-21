@@ -226,7 +226,7 @@ class SceneBuilder:
         )
         forward = safe_normalize_np(target - eye)
         view = look_at(eye, target, np.array([0.0, 1.0, 0.0], dtype=np.float32))
-        near, far = self._clip_planes_from_meshes(meshes, view)
+        near, far = self._clip_planes_from_meshes(meshes, view, camera_position=eye)
         proj = self._projection_matrix(config, near, far, distance)
         return CameraData(
             view=torch.as_tensor(view, dtype=torch.float32, device=self.device),
@@ -373,12 +373,28 @@ class SceneBuilder:
             return "pbr" if has_pbr_signals else "diffuse"
         return "diffuse"
 
-    def _clip_planes_from_meshes(self, meshes: Sequence[MeshData], view: np.ndarray) -> tuple[float, float]:
+    def _clip_planes_from_meshes(
+        self,
+        meshes: Sequence[MeshData],
+        view: np.ndarray,
+        camera_position: np.ndarray | None = None,
+    ) -> tuple[float, float]:
         view_t = torch.as_tensor(view, dtype=torch.float32, device=self.device)
+        if camera_position is None:
+            rotation = np.asarray(view[:3, :3], dtype=np.float32)
+            camera_position = -(rotation.T @ np.asarray(view[:3, 3], dtype=np.float32))
+        camera_position_t = torch.as_tensor(
+            camera_position,
+            dtype=torch.float32,
+            device=self.device,
+        )
         positive_depth_min = None
         positive_depth_max = None
         for mesh in meshes:
-            view_pos = torch.matmul(mesh.positions, view_t[:3, :3].t()) + view_t[:3, 3]
+            view_pos = torch.matmul(
+                mesh.positions - camera_position_t.view(1, 3),
+                view_t[:3, :3].t(),
+            )
             depth = -view_pos[:, 2]
             visible_depth = depth[depth > 0.0]
             if visible_depth.numel() == 0:

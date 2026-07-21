@@ -60,6 +60,31 @@ class SceneBuilderClipPlaneTests(unittest.TestCase):
         self.assertAlmostEqual(near, 64.6)
         self.assertAlmostEqual(far, 187.95)
 
+    def test_clip_planes_are_stable_for_small_offset_mesh(self):
+        camera_position = np.array([998.5, -829.4, 16.2], dtype=np.float32)
+        local_positions = torch.tensor(
+            [
+                [-0.07, -0.11, -0.35],
+                [0.07, -0.11, -0.35],
+                [0.0, 0.12, -0.55],
+            ],
+            dtype=torch.float32,
+        )
+        mesh = SimpleNamespace(
+            positions=local_positions + torch.as_tensor(camera_position),
+        )
+        view = np.eye(4, dtype=np.float32)
+        view[:3, 3] = -camera_position
+
+        near, far = self.builder._clip_planes_from_meshes(
+            [mesh],
+            view,
+            camera_position=camera_position,
+        )
+
+        self.assertAlmostEqual(near, 0.35 * 0.95, places=3)
+        self.assertAlmostEqual(far, 0.55 * 1.05, places=3)
+
     def test_orthographic_projection_ignores_fov(self):
         center = np.zeros(3, dtype=np.float32)
         radius = 2.0

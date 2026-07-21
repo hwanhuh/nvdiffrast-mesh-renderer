@@ -1,4 +1,5 @@
 from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -17,10 +18,8 @@ class GeometryPassRenderer:
         self.config = config
 
     def render_geometry_pass(self, mesh: MeshData, camera: CameraData) -> List[RenderLayer]:
-        positions_h = torch.cat([mesh.positions, torch.ones_like(mesh.positions[:, :1])], dim=-1).contiguous()
-        clip_pos = torch.matmul(positions_h, camera.mvp.t()).contiguous()
+        clip_pos, view_attr = self._camera_relative_positions(mesh.positions, camera)
         clip_pos_batch = clip_pos.unsqueeze(0)
-        view_attr = torch.matmul(positions_h, camera.view.t())[:, :3].contiguous()
         face_normals = compute_face_normals_torch(mesh.positions, mesh.faces)
         tangents = self._resolve_tangents(mesh)
         front_tri, front_normals, back_tri, back_normals = self._split_triangles_by_facing(
@@ -35,6 +34,22 @@ class GeometryPassRenderer:
         if not cull_backfaces:
             layers.extend(self._render_side_layers(mesh, camera, clip_pos_batch, view_attr, tangents, back_tri, back_normals, side="back", max_layers=self.config.double_sided_depth_peels))
         return layers
+
+    @staticmethod
+    def _camera_relative_positions(
+        positions: torch.Tensor,
+        camera: CameraData,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Avoid cancellation between large world coordinates and the view
+        # translation when a small mesh is far from the origin.
+        relative = positions - camera.position.view(1, 3)
+        view_attr = torch.matmul(relative, camera.view[:3, :3].t()).contiguous()
+        view_h = torch.cat(
+            [view_attr, torch.ones_like(view_attr[:, :1])],
+            dim=-1,
+        ).contiguous()
+        clip_pos = torch.matmul(view_h, camera.proj.t()).contiguous()
+        return clip_pos, view_attr
 
     def _resolve_tangents(self, mesh: MeshData) -> Optional[torch.Tensor]:
         if mesh.material.normal_texture is None or mesh.uv is None:
